@@ -11,3 +11,7 @@ clap = { version = "4", features = ["derive"] }
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true

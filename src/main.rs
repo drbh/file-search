@@ -1,8 +1,10 @@
 mod scan;
 
 use clap::Parser;
-use scan::{scan, FileFilter, ResultBatch};
-use std::io::{self, BufWriter, Write};
+use scan::{scan, FileFilter, ResultBatch, ScanOptions};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "file-search")]
@@ -40,9 +42,104 @@ struct Cli {
     #[arg(short, long)]
     stats: bool,
 
+    /// Include hidden directories (names starting with '.')
+    #[arg(long)]
+    hidden: bool,
+
+    /// Disable default directory pruning (.git, node_modules, target, etc.)
+    #[arg(long)]
+    no_default_prunes: bool,
+
+    /// Additional directory names to exclude (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    exclude_dir: Option<Vec<String>>,
+
+    /// Path to ignore config file (defaults to <scan-root>/.file-search-ignore)
+    #[arg(long)]
+    ignore_config: Option<String>,
+
     /// Quiet mode - only output file paths or count
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Default)]
+struct IgnoreRules {
+    dir_names: Vec<String>,
+    path_prefixes: Vec<String>,
+}
+
+fn normalize_prefix(raw: &str, scan_root: &Path) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let path = if raw.starts_with("~/") {
+        expand_tilde(raw)
+    } else if raw.starts_with('/') {
+        PathBuf::from(raw)
+    } else {
+        scan_root.join(raw)
+    };
+
+    let mut normalized = path.to_string_lossy().to_string();
+    while normalized.ends_with('/') && normalized.len() > 1 {
+        normalized.pop();
+    }
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn load_ignore_rules(config_path: &Path, scan_root: &Path) -> io::Result<IgnoreRules> {
+    let file = File::open(config_path)?;
+    let reader = BufReader::new(file);
+    let mut rules = IgnoreRules::default();
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("dir:") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                rules.dir_names.push(name.to_string());
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("path:") {
+            if let Some(prefix) = normalize_prefix(rest.trim(), scan_root) {
+                rules.path_prefixes.push(prefix);
+            }
+            continue;
+        }
+
+        if line.contains('/') {
+            if let Some(prefix) = normalize_prefix(line, scan_root) {
+                rules.path_prefixes.push(prefix);
+            }
+        } else {
+            rules.dir_names.push(line.to_string());
+        }
+    }
+
+    Ok(rules)
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 fn main() {
@@ -50,28 +147,77 @@ fn main() {
 
     // Build filter from CLI options
     let filter = if let Some(exts) = &cli.ext {
-        let normalized: Vec<String> = exts.iter().map(|e| e.to_ascii_lowercase()).collect();
+        let normalized: Vec<Box<[u8]>> = exts
+            .iter()
+            .map(|e| {
+                e.trim_start_matches('.')
+                    .to_ascii_lowercase()
+                    .into_bytes()
+                    .into_boxed_slice()
+            })
+            .filter(|e| !e.is_empty())
+            .collect();
         FileFilter::Extensions(normalized)
     } else if let Some(pattern) = &cli.contains {
-        FileFilter::Contains(pattern.clone())
+        FileFilter::Contains(pattern.to_ascii_lowercase().into_bytes().into_boxed_slice())
     } else if let Some(prefix) = &cli.prefix {
-        FileFilter::Prefix(prefix.clone())
+        FileFilter::Prefix(prefix.to_ascii_lowercase().into_bytes().into_boxed_slice())
     } else if let Some(suffix) = &cli.suffix {
-        FileFilter::Suffix(suffix.clone())
+        FileFilter::Suffix(suffix.to_ascii_lowercase().into_bytes().into_boxed_slice())
     } else {
         FileFilter::All
     };
 
     // Resolve to absolute path
-    let path = std::fs::canonicalize(&cli.path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&cli.path));
+    let path =
+        std::fs::canonicalize(&cli.path).unwrap_or_else(|_| std::path::PathBuf::from(&cli.path));
     let path_str = path.to_string_lossy().to_string();
+
+    let mut ignore_dir_names = cli.exclude_dir.clone().unwrap_or_default();
+    let mut ignore_path_prefixes = Vec::new();
+    let ignore_config_path = cli
+        .ignore_config
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(|| path.join(".file-search-ignore"));
+    let explicit_ignore_config = cli.ignore_config.is_some();
+
+    if ignore_config_path.exists() {
+        match load_ignore_rules(&ignore_config_path, &path) {
+            Ok(mut rules) => {
+                ignore_dir_names.append(&mut rules.dir_names);
+                ignore_path_prefixes.append(&mut rules.path_prefixes);
+            }
+            Err(err) => eprintln!(
+                "warning: failed to load ignore config {}: {}",
+                ignore_config_path.display(),
+                err
+            ),
+        }
+    } else if explicit_ignore_config {
+        eprintln!(
+            "warning: ignore config not found: {}",
+            ignore_config_path.display()
+        );
+    }
+
+    ignore_dir_names.sort_unstable();
+    ignore_dir_names.dedup();
+    ignore_path_prefixes.sort_unstable();
+    ignore_path_prefixes.dedup();
+
+    let scan_options = ScanOptions {
+        include_hidden_dirs: cli.hidden,
+        prune_defaults: !cli.no_default_prunes,
+        ignore_dir_names,
+        ignore_path_prefixes,
+    };
 
     if !cli.quiet {
         eprintln!("Scanning: {}", path_str);
     }
 
-    let handle = scan(&path_str, cli.list, cli.depth, filter);
+    let handle = scan(&path_str, cli.list, cli.depth, filter, scan_options);
 
     let mut total: usize = 0;
     let stdout = io::stdout();
@@ -105,9 +251,18 @@ fn main() {
         eprintln!("getattrlistbulk calls: {}", stats.getattr_calls);
         eprintln!("entries returned:      {}", stats.getattr_entries);
         eprintln!("avg entries/call:      {:.1}", stats.avg_entries_per_call());
+        eprintln!("getattr errors:        {}", stats.getattr_errors);
         eprintln!("openat calls:          {}", stats.openat_calls);
+        eprintln!(
+            "openat abs/rel:        {}/{}",
+            stats.openat_abs_calls, stats.openat_rel_calls
+        );
+        eprintln!("openat failures:       {}", stats.openat_fails);
         eprintln!("close calls:           {}", stats.close_calls);
         eprintln!("openat time:           {:.2} ms", stats.openat_ms);
         eprintln!("getattr time:          {:.2} ms", stats.getattr_ms);
+        eprintln!("rdahead calls:         {}", stats.rdahead_calls);
+        eprintln!("rdahead failures:      {}", stats.rdahead_fails);
+        eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
     }
 }

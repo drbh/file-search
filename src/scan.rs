@@ -1,8 +1,8 @@
-use crossbeam_channel::{unbounded, RecvTimeoutError};
+use crossbeam_channel::unbounded;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 #[repr(C)]
@@ -62,7 +62,9 @@ const BULK_EXPAND_SLACK: usize = 128 << 10; // grow when buffer nearly full
 const DEFAULT_FD_LIMIT: usize = 1024;
 const FD_HEADROOM: usize = 64;
 const FD_MIN_LIMIT: usize = 64;
-const FD_MAX_LIMIT: usize = 4096;
+const FD_MAX_LIMIT: usize = 65536;
+const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
+const PATH_RESULT_BATCH_SIZE: usize = 4096;
 
 // Darwin vtype constants
 const VREG: u32 = 1;
@@ -71,14 +73,175 @@ const VDIR: u32 = 2;
 static GETATTR_CALLS: AtomicU64 = AtomicU64::new(0);
 static GETATTR_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static OPENAT_CALLS: AtomicU64 = AtomicU64::new(0);
+static OPENAT_ABS_CALLS: AtomicU64 = AtomicU64::new(0);
+static OPENAT_REL_CALLS: AtomicU64 = AtomicU64::new(0);
+static OPENAT_FAILS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static GETATTR_NANOS: AtomicU64 = AtomicU64::new(0);
+static GETATTR_ERRORS: AtomicU64 = AtomicU64::new(0);
+static RDAHEAD_CALLS: AtomicU64 = AtomicU64::new(0);
+static RDAHEAD_FAILS: AtomicU64 = AtomicU64::new(0);
+static RDAHEAD_NANOS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+unsafe fn timed_openat(dfd: i32, path: *const i8, oflag: i32, absolute: bool) -> i32 {
+    let start = Instant::now();
+    let fd = openat(dfd, path, oflag);
+    OPENAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    if absolute {
+        OPENAT_ABS_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        OPENAT_REL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    if fd < 0 {
+        OPENAT_FAILS.fetch_add(1, Ordering::Relaxed);
+    }
+    OPENAT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    fd
+}
+
+#[inline]
+unsafe fn timed_getattrlistbulk(
+    dirfd: i32,
+    al: *const attrlist,
+    buf: *mut core::ffi::c_void,
+    size: usize,
+) -> isize {
+    let start = Instant::now();
+    let n = getattrlistbulk(dirfd, al, buf, size, 0);
+    GETATTR_CALLS.fetch_add(1, Ordering::Relaxed);
+    if n > 0 {
+        GETATTR_ENTRIES.fetch_add(n as u64, Ordering::Relaxed);
+    } else if n < 0 {
+        GETATTR_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    GETATTR_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    n
+}
+
+#[inline]
+unsafe fn timed_set_rdahead(fd: i32) {
+    let start = Instant::now();
+    let rc = fcntl(fd, F_RDAHEAD, 1);
+    RDAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+    if rc < 0 {
+        RDAHEAD_FAILS.fetch_add(1, Ordering::Relaxed);
+    }
+    RDAHEAD_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+#[derive(Clone)]
+pub struct ScanOptions {
+    pub include_hidden_dirs: bool,
+    pub prune_defaults: bool,
+    pub ignore_dir_names: Vec<String>,
+    pub ignore_path_prefixes: Vec<String>,
+}
+
+#[inline]
+fn is_default_prune_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "node_modules"
+            | ".next"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "target"
+            | "dist"
+            | "build"
+            | ".cache"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".ruff_cache"
+            | ".tox"
+            | ".nox"
+            | ".gradle"
+            | ".idea"
+            | ".vscode"
+            | ".pnpm-store"
+            | ".yarn"
+            | ".sass-cache"
+            | ".parcel-cache"
+            | ".turbo"
+            | ".angular"
+            | "Pods"
+            | "DerivedData"
+            | "bazel-out"
+            | "bazel-bin"
+            | "bazel-testlogs"
+            | ".terraform"
+            | ".serverless"
+            | ".aws-sam"
+    )
+}
+
+#[inline]
+fn matches_path_prefix(candidate: &str, prefix: &str) -> bool {
+    if candidate == prefix {
+        return true;
+    }
+    candidate
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            include_hidden_dirs: false,
+            prune_defaults: true,
+            ignore_dir_names: Vec::new(),
+            ignore_path_prefixes: Vec::new(),
+        }
+    }
+}
+
+impl ScanOptions {
+    #[inline]
+    fn should_skip_dir(&self, parent_path: &str, name: &str) -> bool {
+        if !self.include_hidden_dirs && name.starts_with('.') {
+            return true;
+        }
+        if self.prune_defaults && is_default_prune_dir(name) {
+            return true;
+        }
+        if !self.ignore_dir_names.is_empty() && self.ignore_dir_names.iter().any(|dir| dir == name)
+        {
+            return true;
+        }
+        if self.ignore_path_prefixes.is_empty() {
+            return false;
+        }
+
+        let mut child_path = String::with_capacity(parent_path.len() + name.len() + 1);
+        if parent_path == "/" {
+            child_path.push('/');
+            child_path.push_str(name);
+        } else {
+            child_path.push_str(parent_path);
+            child_path.push('/');
+            child_path.push_str(name);
+        }
+        self.ignore_path_prefixes
+            .iter()
+            .any(|prefix| matches_path_prefix(&child_path, prefix))
+    }
+}
 
 struct WorkItem {
     path: String,
     dirfd: Option<RawFd>,
     depth: usize,
+}
+
+enum WorkMsg {
+    Dir(WorkItem),
+    Shutdown,
 }
 
 struct PathScratch {
@@ -137,7 +300,7 @@ impl FdBudget {
             match self.in_use.compare_exchange_weak(
                 current,
                 current + 1,
-                Ordering::SeqCst,
+                Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
@@ -147,7 +310,20 @@ impl FdBudget {
     }
 
     fn release(&self) {
-        self.in_use.fetch_sub(1, Ordering::SeqCst);
+        self.in_use.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[inline]
+fn mark_work_complete(
+    active_count: &AtomicUsize,
+    work_tx: &crossbeam_channel::Sender<WorkMsg>,
+    workers: usize,
+) {
+    if active_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        for _ in 0..workers {
+            let _ = work_tx.send(WorkMsg::Shutdown);
+        }
     }
 }
 
@@ -157,67 +333,128 @@ pub enum FileFilter {
     /// Match all regular files
     All,
     /// Match files with specific extensions (case-insensitive)
-    Extensions(Vec<String>),
+    Extensions(Vec<Box<[u8]>>),
     /// Match files containing a substring (case-insensitive)
-    Contains(String),
+    Contains(Box<[u8]>),
     /// Match files with a prefix
-    Prefix(String),
+    Prefix(Box<[u8]>),
     /// Match files with a suffix (before extension)
-    Suffix(String),
+    Suffix(Box<[u8]>),
+}
+
+#[inline]
+fn ascii_fold(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() {
+        byte + 32
+    } else {
+        byte
+    }
+}
+
+#[inline]
+fn eq_ascii_fold(input: &[u8], pattern_lower: &[u8]) -> bool {
+    if input.len() != pattern_lower.len() {
+        return false;
+    }
+    input
+        .iter()
+        .zip(pattern_lower.iter())
+        .all(|(a, b)| ascii_fold(*a) == *b)
+}
+
+#[inline]
+fn starts_with_ascii_fold(input: &[u8], prefix_lower: &[u8]) -> bool {
+    if prefix_lower.len() > input.len() {
+        return false;
+    }
+    input[..prefix_lower.len()]
+        .iter()
+        .zip(prefix_lower.iter())
+        .all(|(a, b)| ascii_fold(*a) == *b)
+}
+
+#[inline]
+fn ends_with_ascii_fold(input: &[u8], suffix_lower: &[u8]) -> bool {
+    if suffix_lower.len() > input.len() {
+        return false;
+    }
+    let start = input.len() - suffix_lower.len();
+    input[start..]
+        .iter()
+        .zip(suffix_lower.iter())
+        .all(|(a, b)| ascii_fold(*a) == *b)
+}
+
+#[inline]
+fn contains_ascii_fold(input: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > input.len() {
+        return false;
+    }
+
+    let last_start = input.len() - needle_lower.len();
+    for i in 0..=last_start {
+        if ascii_fold(input[i]) != needle_lower[0] {
+            continue;
+        }
+        let mut matched = true;
+        for j in 1..needle_lower.len() {
+            if ascii_fold(input[i + j]) != needle_lower[j] {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
 }
 
 impl FileFilter {
     #[inline]
     fn matches(&self, name: &str) -> bool {
+        let name_bytes = name.as_bytes();
         match self {
             FileFilter::All => true,
             FileFilter::Extensions(exts) => {
-                let bytes = name.as_bytes();
-                let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else {
+                let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') else {
                     return false;
                 };
-                let ext = &bytes[dot + 1..];
+                let ext = &name_bytes[dot + 1..];
                 if ext.is_empty() {
                     return false;
                 }
-                // Convert to lowercase for comparison
-                let ext_lower: String = ext.iter().map(|&b| b.to_ascii_lowercase() as char).collect();
-                exts.iter().any(|e| e == &ext_lower)
+                exts.iter().any(|e| eq_ascii_fold(ext, e))
             }
-            FileFilter::Contains(pattern) => {
-                name.to_ascii_lowercase().contains(&pattern.to_ascii_lowercase())
-            }
-            FileFilter::Prefix(prefix) => {
-                name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
-            }
+            FileFilter::Contains(pattern) => contains_ascii_fold(name_bytes, pattern),
+            FileFilter::Prefix(prefix) => starts_with_ascii_fold(name_bytes, prefix),
             FileFilter::Suffix(suffix) => {
                 // Match suffix before extension
-                let base = if let Some(dot) = name.rfind('.') {
-                    &name[..dot]
+                let base = if let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') {
+                    &name_bytes[..dot]
                 } else {
-                    name
+                    name_bytes
                 };
-                base.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+                ends_with_ascii_fold(base, suffix)
             }
         }
     }
 }
 
-#[inline]
-fn should_skip_dir(_parent_path: &str, _name: &str) -> bool {
-    // matches!(name, ".git" | ".hg" | ".svn" | "node_modules")
-    false
-}
-
 unsafe fn worker(
-    work_rx: crossbeam_channel::Receiver<WorkItem>,
-    work_tx: crossbeam_channel::Sender<WorkItem>,
+    work_rx: crossbeam_channel::Receiver<WorkMsg>,
+    work_tx: crossbeam_channel::Sender<WorkMsg>,
     result_tx: crossbeam_channel::Sender<ResultBatch>,
     active_count: Arc<AtomicUsize>,
     fd_budget: Arc<FdBudget>,
+    workers: usize,
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
+    scan_options: Arc<ScanOptions>,
 ) {
     // Thread-local reusable buffers
     let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
@@ -239,17 +476,10 @@ unsafe fn worker(
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
 
     loop {
-        // Wait briefly for work; exit when everything drained
-        let work = match work_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(w) => w,
-            Err(RecvTimeoutError::Timeout) => {
-                if active_count.load(Ordering::SeqCst) == 0 {
-                    break;
-                } else {
-                    continue;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+        let work = match work_rx.recv() {
+            Ok(WorkMsg::Dir(w)) => w,
+            Ok(WorkMsg::Shutdown) => break,
+            Err(_) => break,
         };
 
         let WorkItem { path, dirfd, depth } = work;
@@ -269,16 +499,14 @@ unsafe fn worker(
                     dir_cbuf.extend_from_slice(path.as_bytes());
                 }
                 dir_cbuf.push(0);
-                let start = std::time::Instant::now();
-                let fd = openat(
+                let fd = timed_openat(
                     AT_FDCWD,
                     dir_cbuf.as_ptr() as *const i8,
                     O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                    true,
                 );
-                OPENAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                OPENAT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if fd < 0 {
-                    active_count.fetch_sub(1, Ordering::SeqCst);
+                    mark_work_complete(&active_count, &work_tx, workers);
                     continue;
                 }
                 fd
@@ -287,16 +515,10 @@ unsafe fn worker(
         path_buf.set_base(&path);
 
         // Enable directory read-ahead for better performance
-        let _ = fcntl(dirfd, F_RDAHEAD, 1);
+        timed_set_rdahead(dirfd);
 
         loop {
-            let start = std::time::Instant::now();
-            let n = getattrlistbulk(dirfd, &al, buf.as_mut_ptr().cast(), buf.len(), 0);
-            if n > 0 {
-                GETATTR_CALLS.fetch_add(1, Ordering::Relaxed);
-                GETATTR_ENTRIES.fetch_add(n as u64, Ordering::Relaxed);
-                GETATTR_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
+            let n = timed_getattrlistbulk(dirfd, &al, buf.as_mut_ptr().cast(), buf.len());
             if n < 0 {
                 // syscall error; stop scanning this directory
                 break;
@@ -323,7 +545,8 @@ unsafe fn worker(
 
                 // Name bytes are at (name_ref_ptr + name_ref.off) with byte length name_ref.len
                 // Calculate offset relative to buffer start
-                let name_start = (name_ref_ptr as usize - buf.as_ptr() as usize) + (name_ref.off as usize);
+                let name_start =
+                    (name_ref_ptr as usize - buf.as_ptr() as usize) + (name_ref.off as usize);
                 let name_len = name_ref.len as usize;
 
                 // Trim a trailing NUL if present; avoid CStr and extra validation work.
@@ -343,7 +566,7 @@ unsafe fn worker(
                 }
 
                 if objtype == VDIR {
-                    if should_skip_dir(&path, name) {
+                    if scan_options.should_skip_dir(&path, name) {
                         p += reclen;
                         continue;
                     }
@@ -359,14 +582,12 @@ unsafe fn worker(
                         name_cbuf.clear();
                         name_cbuf.extend_from_slice(name.as_bytes());
                         name_cbuf.push(0);
-                        let start = std::time::Instant::now();
-                        let cfd = openat(
+                        let cfd = timed_openat(
                             dirfd,
                             name_cbuf.as_ptr() as *const i8,
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                            false,
                         );
-                        OPENAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                        OPENAT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         if cfd >= 0 {
                             next_fd = Some(cfd);
                         } else {
@@ -376,34 +597,34 @@ unsafe fn worker(
                     // If we can't acquire fd budget, next_fd stays None and we'll open by path later
 
                     // Increment counter BEFORE sending to queue to prevent race
-                    active_count.fetch_add(1, Ordering::SeqCst);
+                    active_count.fetch_add(1, Ordering::Relaxed);
                     let composed = path_buf.compose(name).to_owned();
-                    if work_tx
-                        .send(WorkItem {
-                            path: composed,
-                            dirfd: next_fd,
-                            depth: next_depth,
-                        })
-                        .is_err()
-                    {
-                        if let Some(fd) = next_fd {
-                            let _ = close(fd);
-                            fd_budget.release();
+                    let child = WorkItem {
+                        path: composed,
+                        dirfd: next_fd,
+                        depth: next_depth,
+                    };
+                    if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
+                        if let WorkMsg::Dir(failed_child) = err.0 {
+                            if let Some(fd) = failed_child.dirfd {
+                                let _ = close(fd);
+                                fd_budget.release();
+                            }
                         }
-                        active_count.fetch_sub(1, Ordering::SeqCst);
+                        mark_work_complete(&active_count, &work_tx, workers);
                     }
                 } else if objtype == VREG && filter.matches(name) {
                     if list_mode {
                         let composed = path_buf.compose(name).to_owned();
                         pending_paths.push(composed);
-                        if pending_paths.len() >= 2048 {
+                        if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
                             let batch = std::mem::take(&mut pending_paths);
                             let _ = result_tx.send(ResultBatch::Paths(batch));
-                            pending_paths = Vec::with_capacity(2048);
+                            pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
                         }
                     } else {
                         pending_count += 1;
-                        if pending_count >= 1 << 14 {
+                        if pending_count >= COUNT_RESULT_BATCH_SIZE {
                             let _ = result_tx.send(ResultBatch::Count(pending_count));
                             pending_count = 0;
                         }
@@ -427,7 +648,7 @@ unsafe fn worker(
 
         // Decrement counter for this directory finishing
         // (subdirs were already incremented when queued)
-        active_count.fetch_sub(1, Ordering::SeqCst);
+        mark_work_complete(&active_count, &work_tx, workers);
     }
 
     if list_mode {
@@ -457,9 +678,16 @@ pub struct ScanStats {
     pub duration: Duration,
     pub getattr_calls: u64,
     pub getattr_entries: u64,
+    pub getattr_errors: u64,
     pub openat_calls: u64,
+    pub openat_abs_calls: u64,
+    pub openat_rel_calls: u64,
+    pub openat_fails: u64,
     pub openat_ms: f64,
     pub getattr_ms: f64,
+    pub rdahead_calls: u64,
+    pub rdahead_fails: u64,
+    pub rdahead_ms: f64,
     pub close_calls: u64,
 }
 
@@ -487,14 +715,22 @@ impl ScanHandle {
 
         let openat_nanos = OPENAT_NANOS.load(Ordering::Relaxed);
         let getattr_nanos = GETATTR_NANOS.load(Ordering::Relaxed);
+        let rdahead_nanos = RDAHEAD_NANOS.load(Ordering::Relaxed);
 
         ScanStats {
             duration: self.start_time.elapsed(),
             getattr_calls: GETATTR_CALLS.load(Ordering::Relaxed),
             getattr_entries: GETATTR_ENTRIES.load(Ordering::Relaxed),
+            getattr_errors: GETATTR_ERRORS.load(Ordering::Relaxed),
             openat_calls: OPENAT_CALLS.load(Ordering::Relaxed),
+            openat_abs_calls: OPENAT_ABS_CALLS.load(Ordering::Relaxed),
+            openat_rel_calls: OPENAT_REL_CALLS.load(Ordering::Relaxed),
+            openat_fails: OPENAT_FAILS.load(Ordering::Relaxed),
             openat_ms: openat_nanos as f64 / 1_000_000.0,
             getattr_ms: getattr_nanos as f64 / 1_000_000.0,
+            rdahead_calls: RDAHEAD_CALLS.load(Ordering::Relaxed),
+            rdahead_fails: RDAHEAD_FAILS.load(Ordering::Relaxed),
+            rdahead_ms: rdahead_nanos as f64 / 1_000_000.0,
             close_calls: CLOSE_CALLS.load(Ordering::Relaxed),
         }
     }
@@ -512,15 +748,28 @@ impl ScanHandle {
 /// # Returns
 ///
 /// Returns a `ScanHandle` containing a receiver for `ResultBatch` items
-pub fn scan(root_path: &str, list_mode: bool, max_depth: usize, filter: FileFilter) -> ScanHandle {
+pub fn scan(
+    root_path: &str,
+    list_mode: bool,
+    max_depth: usize,
+    filter: FileFilter,
+    options: ScanOptions,
+) -> ScanHandle {
     let start_time = std::time::Instant::now();
 
     // Reset global counters
     GETATTR_CALLS.store(0, Ordering::Relaxed);
     GETATTR_ENTRIES.store(0, Ordering::Relaxed);
+    GETATTR_ERRORS.store(0, Ordering::Relaxed);
     OPENAT_CALLS.store(0, Ordering::Relaxed);
+    OPENAT_ABS_CALLS.store(0, Ordering::Relaxed);
+    OPENAT_REL_CALLS.store(0, Ordering::Relaxed);
+    OPENAT_FAILS.store(0, Ordering::Relaxed);
     OPENAT_NANOS.store(0, Ordering::Relaxed);
     GETATTR_NANOS.store(0, Ordering::Relaxed);
+    RDAHEAD_CALLS.store(0, Ordering::Relaxed);
+    RDAHEAD_FAILS.store(0, Ordering::Relaxed);
+    RDAHEAD_NANOS.store(0, Ordering::Relaxed);
     CLOSE_CALLS.store(0, Ordering::Relaxed);
 
     let mut root_path = root_path.to_string();
@@ -540,10 +789,11 @@ pub fn scan(root_path: &str, list_mode: bool, max_depth: usize, filter: FileFilt
 
     // Ensure root directory can be opened up-front
     let root_fd = unsafe {
-        let fd = openat(
+        let fd = timed_openat(
             AT_FDCWD,
             root_c.as_ptr() as *const i8,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            true,
         );
         if fd < 0 {
             eprintln!("cannot open root: {root_path}");
@@ -563,9 +813,10 @@ pub fn scan(root_path: &str, list_mode: bool, max_depth: usize, filter: FileFilt
         .min(8)
         .max(2);
 
-    let (work_tx, work_rx) = unbounded::<WorkItem>(); // unbounded to prevent deadlock on deep trees
+    let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
     let active = Arc::new(AtomicUsize::new(1)); // root is in-flight
+    let scan_options = Arc::new(options);
 
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
@@ -575,8 +826,11 @@ pub fn scan(root_path: &str, list_mode: bool, max_depth: usize, filter: FileFilt
         let ac = active.clone();
         let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
+        let opts = scan_options.clone();
         handles.push(std::thread::spawn(move || unsafe {
-            worker(rx, tx, rtx, ac, fd_mgr, list_mode, max_depth, flt)
+            worker(
+                rx, tx, rtx, ac, fd_mgr, workers, list_mode, max_depth, flt, opts,
+            )
         }));
     }
 
@@ -590,18 +844,18 @@ pub fn scan(root_path: &str, list_mode: bool, max_depth: usize, filter: FileFilt
 
     // Kick off with root (depth 1)
     let root_item = if fd_budget.try_acquire() {
-        WorkItem {
+        WorkMsg::Dir(WorkItem {
             path: root_path,
             dirfd: Some(root_fd),
             depth: 1,
-        }
+        })
     } else {
         let _ = unsafe { close(root_fd) };
-        WorkItem {
+        WorkMsg::Dir(WorkItem {
             path: root_path,
             dirfd: None,
             depth: 1,
-        }
+        })
     };
     work_tx.send(root_item).unwrap();
     drop(work_tx); // allow workers to terminate when queue drains
