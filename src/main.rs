@@ -1,6 +1,8 @@
+mod index;
 mod scan;
 
 use clap::Parser;
+use index::{build_index, compact_index, index_status, query_index, watch_index};
 use scan::{scan, FileFilter, ResultBatch, ScanOptions};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -57,6 +59,34 @@ struct Cli {
     /// Path to ignore config file (defaults to <scan-root>/.file-search-ignore)
     #[arg(long)]
     ignore_config: Option<String>,
+
+    /// Query using on-disk index instead of live filesystem walk
+    #[arg(long)]
+    use_index: bool,
+
+    /// Build or rebuild index from a full scan
+    #[arg(long)]
+    index_build: bool,
+
+    /// Compact snapshot + delta log into a new snapshot
+    #[arg(long)]
+    index_compact: bool,
+
+    /// Show index status
+    #[arg(long)]
+    index_status: bool,
+
+    /// Watch filesystem changes and append to index delta log
+    #[arg(long)]
+    index_watch: bool,
+
+    /// Disable automatic compaction of large delta logs during indexed query
+    #[arg(long)]
+    no_index_auto_compact: bool,
+
+    /// Stop after returning this many matches
+    #[arg(long)]
+    max_results: Option<usize>,
 
     /// Quiet mode - only output file paths or count
     #[arg(short, long)]
@@ -142,7 +172,7 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn main() {
+fn run() -> io::Result<()> {
     let cli = Cli::parse();
 
     // Build filter from CLI options
@@ -213,6 +243,86 @@ fn main() {
         ignore_path_prefixes,
     };
 
+    let mode_count = usize::from(cli.use_index)
+        + usize::from(cli.index_build)
+        + usize::from(cli.index_compact)
+        + usize::from(cli.index_status)
+        + usize::from(cli.index_watch);
+    if mode_count > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "choose at most one index mode flag",
+        ));
+    }
+
+    if cli.index_build {
+        let build = build_index(&path, cli.depth, scan_options)?;
+        if !cli.quiet {
+            eprintln!("Indexed root: {}", path_str);
+            eprintln!("files indexed: {}", build.files);
+            eprintln!("scan duration: {:.2?}", build.scan_duration);
+            eprintln!("total duration: {:.2?}", build.total_duration);
+            eprintln!("snapshot bytes: {}", build.snapshot_bytes);
+            eprintln!("index dir: {}", build.index_dir.display());
+        }
+        return Ok(());
+    }
+
+    if cli.index_compact {
+        let compact = compact_index(&path)?;
+        if !cli.quiet {
+            eprintln!("Compacted index for {}", path_str);
+            eprintln!("files: {}", compact.files);
+            eprintln!("duration: {:.2?}", compact.duration);
+            eprintln!("snapshot bytes: {}", compact.snapshot_bytes);
+        }
+        return Ok(());
+    }
+
+    if cli.index_status {
+        let status = index_status(&path)?;
+        eprintln!("root: {}", status.root);
+        eprintln!("index dir: {}", status.index_dir.display());
+        eprintln!("snapshot exists: {}", status.snapshot_exists);
+        eprintln!("snapshot files: {}", status.snapshot_files);
+        eprintln!("snapshot size: {}", status.snapshot_size_bytes);
+        eprintln!("snapshot created unix: {}", status.snapshot_created_unix);
+        eprintln!("delta exists: {}", status.delta_exists);
+        eprintln!("delta size: {}", status.delta_size_bytes);
+        eprintln!("delta ops: {}", status.delta_ops);
+        return Ok(());
+    }
+
+    if cli.index_watch {
+        if !cli.quiet {
+            eprintln!("Starting index watcher for {}", path_str);
+        }
+        watch_index(&path)?;
+        return Ok(());
+    }
+
+    if cli.use_index {
+        if !cli.quiet {
+            eprintln!("Querying index: {}", path_str);
+        }
+        let query = query_index(
+            &path,
+            &filter,
+            cli.list,
+            cli.max_results,
+            !cli.no_index_auto_compact,
+        )?;
+        if !cli.quiet {
+            eprintln!("\nFound {} files in {:.2?}", query.files, query.duration);
+            if query.auto_compacted {
+                eprintln!("(auto-compacted delta log)");
+            }
+        } else if !cli.list {
+            println!("{}", query.files);
+        }
+        return Ok(());
+    }
+
     if !cli.quiet {
         eprintln!("Scanning: {}", path_str);
     }
@@ -264,5 +374,13 @@ fn main() {
         eprintln!("rdahead calls:         {}", stats.rdahead_calls);
         eprintln!("rdahead failures:      {}", stats.rdahead_fails);
         eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("error: {}", err);
+        std::process::exit(1);
     }
 }

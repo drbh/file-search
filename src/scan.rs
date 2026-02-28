@@ -415,7 +415,7 @@ fn contains_ascii_fold(input: &[u8], needle_lower: &[u8]) -> bool {
 
 impl FileFilter {
     #[inline]
-    fn matches(&self, name: &str) -> bool {
+    pub fn matches(&self, name: &str) -> bool {
         let name_bytes = name.as_bytes();
         match self {
             FileFilter::All => true,
