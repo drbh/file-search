@@ -1,7 +1,9 @@
+mod content;
 mod index;
 mod scan;
 
 use clap::Parser;
+use content::{build_content_index, content_index_status, query_content_index};
 use index::{build_index, compact_index, index_status, query_index, watch_index};
 use scan::{scan, FileFilter, ResultBatch, ScanOptions};
 use std::fs::File;
@@ -87,6 +89,30 @@ struct Cli {
     /// Stop after returning this many matches
     #[arg(long)]
     max_results: Option<usize>,
+
+    /// Build or rebuild content trigram index
+    #[arg(long)]
+    content_index_build: bool,
+
+    /// Search literal text within files using content index
+    #[arg(long)]
+    content_search: Option<String>,
+
+    /// Show content index status
+    #[arg(long)]
+    content_index_status: bool,
+
+    /// Max file size for content indexing (bytes)
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    content_max_file_size: u64,
+
+    /// Include binary files in content index/search
+    #[arg(long)]
+    content_include_binary: bool,
+
+    /// Number of worker threads for content indexing (0 = auto)
+    #[arg(long, default_value_t = 0)]
+    content_workers: usize,
 
     /// Quiet mode - only output file paths or count
     #[arg(short, long)]
@@ -247,7 +273,10 @@ fn run() -> io::Result<()> {
         + usize::from(cli.index_build)
         + usize::from(cli.index_compact)
         + usize::from(cli.index_status)
-        + usize::from(cli.index_watch);
+        + usize::from(cli.index_watch)
+        + usize::from(cli.content_index_build)
+        + usize::from(cli.content_index_status)
+        + usize::from(cli.content_search.is_some());
     if mode_count > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -298,6 +327,61 @@ fn run() -> io::Result<()> {
             eprintln!("Starting index watcher for {}", path_str);
         }
         watch_index(&path)?;
+        return Ok(());
+    }
+
+    if cli.content_index_build {
+        let build = build_content_index(
+            &path,
+            cli.depth,
+            scan_options,
+            cli.content_max_file_size,
+            cli.content_include_binary,
+            cli.content_workers,
+        )?;
+        if !cli.quiet {
+            eprintln!("Built content index for {}", path_str);
+            eprintln!("workers: {}", build.workers);
+            eprintln!("files scanned: {}", build.files_scanned);
+            eprintln!("files indexed: {}", build.files_indexed);
+            eprintln!("skipped binary: {}", build.files_skipped_binary);
+            eprintln!("skipped too large: {}", build.files_skipped_too_large);
+            eprintln!("bytes indexed: {}", build.total_bytes_indexed);
+            eprintln!("scan duration: {:.2?}", build.scan_duration);
+            eprintln!("total duration: {:.2?}", build.total_duration);
+            eprintln!("snapshot bytes: {}", build.snapshot_bytes);
+            eprintln!("index dir: {}", build.index_dir.display());
+        }
+        return Ok(());
+    }
+
+    if cli.content_index_status {
+        let status = content_index_status(&path)?;
+        eprintln!("root: {}", status.root);
+        eprintln!("index dir: {}", status.index_dir.display());
+        eprintln!("snapshot exists: {}", status.snapshot_exists);
+        eprintln!("files indexed: {}", status.files_indexed);
+        eprintln!("grams indexed: {}", status.grams_indexed);
+        eprintln!("snapshot size: {}", status.snapshot_size_bytes);
+        eprintln!("snapshot created unix: {}", status.snapshot_created_unix);
+        eprintln!("include binary: {}", status.include_binary);
+        eprintln!("max file size: {}", status.max_file_size);
+        return Ok(());
+    }
+
+    if let Some(needle) = &cli.content_search {
+        if !cli.quiet {
+            eprintln!("Content search via index: {}", path_str);
+        }
+        let query = query_content_index(&path, needle, cli.list, cli.max_results)?;
+        if !cli.quiet {
+            eprintln!(
+                "\nFound {} matching files in {:.2?} ({} candidates)",
+                query.matches, query.duration, query.candidates
+            );
+        } else if !cli.list {
+            println!("{}", query.matches);
+        }
         return Ok(());
     }
 
