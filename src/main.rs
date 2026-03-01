@@ -3,7 +3,7 @@ mod index;
 mod scan;
 
 use clap::Parser;
-use content::{build_content_index, content_index_status, query_content_index};
+use content::{build_content_index, content_index_status, query_content_index, query_content_live};
 use index::{build_index, compact_index, index_status, query_index, watch_index};
 use scan::{scan, FileFilter, ResultBatch, ScanOptions};
 use std::fs::File;
@@ -97,6 +97,10 @@ struct Cli {
     /// Search literal text within files using content index
     #[arg(long)]
     content_search: Option<String>,
+
+    /// Search literal text via live filesystem scan (no persistent index)
+    #[arg(long)]
+    content_search_live: Option<String>,
 
     /// Show content index status
     #[arg(long)]
@@ -276,7 +280,8 @@ fn run() -> io::Result<()> {
         + usize::from(cli.index_watch)
         + usize::from(cli.content_index_build)
         + usize::from(cli.content_index_status)
-        + usize::from(cli.content_search.is_some());
+        + usize::from(cli.content_search.is_some())
+        + usize::from(cli.content_search_live.is_some());
     if mode_count > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -374,6 +379,32 @@ fn run() -> io::Result<()> {
             eprintln!("Content search via index: {}", path_str);
         }
         let query = query_content_index(&path, needle, cli.list, cli.max_results)?;
+        if !cli.quiet {
+            eprintln!(
+                "\nFound {} matching files in {:.2?} ({} candidates)",
+                query.matches, query.duration, query.candidates
+            );
+        } else if !cli.list {
+            println!("{}", query.matches);
+        }
+        return Ok(());
+    }
+
+    if let Some(needle) = &cli.content_search_live {
+        if !cli.quiet {
+            eprintln!("Content search via live scan: {}", path_str);
+        }
+        let query = query_content_live(
+            &path,
+            cli.depth,
+            scan_options,
+            needle,
+            cli.list,
+            cli.max_results,
+            cli.content_max_file_size,
+            cli.content_include_binary,
+            cli.content_workers,
+        )?;
         if !cli.quiet {
             eprintln!(
                 "\nFound {} matching files in {:.2?} ({} candidates)",
