@@ -332,14 +332,13 @@ fn mark_work_complete(
 pub enum FileFilter {
     /// Match all regular files
     All,
-    /// Match files with specific extensions (case-insensitive)
-    Extensions(Vec<Box<[u8]>>),
-    /// Match files containing a substring (case-insensitive)
-    Contains(Box<[u8]>),
-    /// Match files with a prefix
-    Prefix(Box<[u8]>),
-    /// Match files with a suffix (before extension)
-    Suffix(Box<[u8]>),
+    /// Match when all provided clauses pass (logical AND)
+    Composite {
+        extensions: Option<Vec<Box<[u8]>>>,
+        contains_all: Vec<Box<[u8]>>,
+        prefix: Option<Box<[u8]>>,
+        suffix: Option<Box<[u8]>>,
+    },
 }
 
 #[inline]
@@ -415,30 +414,60 @@ fn contains_ascii_fold(input: &[u8], needle_lower: &[u8]) -> bool {
 
 impl FileFilter {
     #[inline]
+    fn matches_extension(name_bytes: &[u8], exts: &[Box<[u8]>]) -> bool {
+        let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') else {
+            return false;
+        };
+        let ext = &name_bytes[dot + 1..];
+        if ext.is_empty() {
+            return false;
+        }
+        exts.iter().any(|e| eq_ascii_fold(ext, e))
+    }
+
+    #[inline]
+    fn matches_suffix(name_bytes: &[u8], suffix: &[u8]) -> bool {
+        // Match suffix before extension
+        let base = if let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') {
+            &name_bytes[..dot]
+        } else {
+            name_bytes
+        };
+        ends_with_ascii_fold(base, suffix)
+    }
+
+    #[inline]
     pub fn matches(&self, name: &str) -> bool {
         let name_bytes = name.as_bytes();
         match self {
             FileFilter::All => true,
-            FileFilter::Extensions(exts) => {
-                let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') else {
-                    return false;
-                };
-                let ext = &name_bytes[dot + 1..];
-                if ext.is_empty() {
-                    return false;
+            FileFilter::Composite {
+                extensions,
+                contains_all,
+                prefix,
+                suffix,
+            } => {
+                if let Some(exts) = extensions {
+                    if !Self::matches_extension(name_bytes, exts) {
+                        return false;
+                    }
                 }
-                exts.iter().any(|e| eq_ascii_fold(ext, e))
-            }
-            FileFilter::Contains(pattern) => contains_ascii_fold(name_bytes, pattern),
-            FileFilter::Prefix(prefix) => starts_with_ascii_fold(name_bytes, prefix),
-            FileFilter::Suffix(suffix) => {
-                // Match suffix before extension
-                let base = if let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') {
-                    &name_bytes[..dot]
-                } else {
-                    name_bytes
-                };
-                ends_with_ascii_fold(base, suffix)
+                for needle in contains_all {
+                    if !contains_ascii_fold(name_bytes, needle) {
+                        return false;
+                    }
+                }
+                if let Some(pfx) = prefix {
+                    if !starts_with_ascii_fold(name_bytes, pfx) {
+                        return false;
+                    }
+                }
+                if let Some(sfx) = suffix {
+                    if !Self::matches_suffix(name_bytes, sfx) {
+                        return false;
+                    }
+                }
+                true
             }
         }
     }

@@ -1,5 +1,6 @@
 use crate::scan::{scan, FileFilter, ResultBatch, ScanOptions};
 use crossbeam_channel as channel;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -19,6 +20,7 @@ pub struct ContentQueryStats {
 struct ContentLiveWorkerOutput {
     matches: usize,
     candidates: usize,
+    listed_paths: Vec<String>,
 }
 
 #[inline]
@@ -66,6 +68,18 @@ fn try_take_match_slot(counter: &AtomicUsize, max_results: Option<usize>) -> boo
     }
 }
 
+#[inline]
+fn clamp_list_path_segments(path: &str, root: &Path, segments: usize) -> String {
+    let Ok(relative) = Path::new(path).strip_prefix(root) else {
+        return path.to_string();
+    };
+    let mut out = root.to_path_buf();
+    for comp in relative.components().take(segments) {
+        out.push(comp.as_os_str());
+    }
+    out.to_string_lossy().to_string()
+}
+
 fn run_content_live_worker(
     work_rx: channel::Receiver<String>,
     needle: Arc<Vec<u8>>,
@@ -75,9 +89,11 @@ fn run_content_live_worker(
     global_matches: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     list_mode: bool,
+    segments: Option<usize>,
 ) -> ContentLiveWorkerOutput {
     let mut matches = 0usize;
     let mut candidates = 0usize;
+    let mut listed_paths: Vec<String> = Vec::new();
 
     for path in &work_rx {
         if stop.load(Ordering::Relaxed) {
@@ -114,7 +130,11 @@ fn run_content_live_worker(
         }
 
         if list_mode {
-            println!("{path}");
+            if segments.is_none() {
+                println!("{path}");
+            } else {
+                listed_paths.push(path);
+            }
         }
         matches += 1;
 
@@ -126,6 +146,7 @@ fn run_content_live_worker(
     ContentLiveWorkerOutput {
         matches,
         candidates,
+        listed_paths,
     }
 }
 
@@ -133,8 +154,10 @@ pub fn query_content_live(
     root: &Path,
     max_depth: usize,
     scan_options: ScanOptions,
+    file_filter: FileFilter,
     needle: &str,
     list_mode: bool,
+    segments: Option<usize>,
     max_results: Option<usize>,
     max_file_size: u64,
     include_binary: bool,
@@ -150,7 +173,7 @@ pub fn query_content_live(
     let started = Instant::now();
     let workers = resolve_content_workers(requested_workers);
     let root_str = root.to_string_lossy().to_string();
-    let scan_handle = scan(&root_str, true, max_depth, FileFilter::All, scan_options);
+    let scan_handle = scan(&root_str, true, max_depth, file_filter, scan_options);
     let (work_tx, work_rx) = channel::bounded::<String>(workers.saturating_mul(1024).max(1024));
 
     let needle = Arc::new(needle.as_bytes().to_vec());
@@ -173,6 +196,7 @@ pub fn query_content_live(
                 gm,
                 stop_flag,
                 list_mode,
+                segments,
             )
         }));
     }
@@ -200,12 +224,36 @@ pub fn query_content_live(
 
     let mut matches = 0usize;
     let mut candidates = 0usize;
+    let mut clamped_set: HashSet<String> = HashSet::new();
     for handle in handles {
-        let output = handle
+        let mut output = handle
             .join()
             .map_err(|_| io::Error::other("content live search worker thread panicked"))?;
         matches += output.matches;
         candidates += output.candidates;
+        if list_mode {
+            let Some(segment_count) = segments else {
+                continue;
+            };
+            for path in output.listed_paths.drain(..) {
+                clamped_set.insert(clamp_list_path_segments(&path, root, segment_count));
+            }
+        }
+    }
+
+    if list_mode {
+        let Some(_) = segments else {
+            return Ok(ContentQueryStats {
+                matches,
+                candidates,
+                duration: started.elapsed(),
+            });
+        };
+        let mut paths: Vec<String> = clamped_set.into_iter().collect();
+        paths.sort_unstable();
+        for path in paths {
+            println!("{path}");
+        }
     }
 
     Ok(ContentQueryStats {

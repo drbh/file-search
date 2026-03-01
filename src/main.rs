@@ -4,6 +4,7 @@ mod scan;
 use clap::Parser;
 use content::query_content_live;
 use scan::{scan, FileFilter, ResultBatch, ScanOptions};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -16,9 +17,17 @@ struct Cli {
     #[arg(default_value = ".")]
     path: String,
 
+    /// Filename substring filter (positional)
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+
     /// List file paths instead of just counting
     #[arg(short, long)]
     list: bool,
+
+    /// Clamp listed paths to at most N path segments below the input root and deduplicate
+    #[arg(short = 'g', long)]
+    segments: Option<usize>,
 
     /// Maximum depth to traverse (0 = unlimited)
     #[arg(short, long, default_value = "0")]
@@ -28,9 +37,9 @@ struct Cli {
     #[arg(short, long, value_delimiter = ',')]
     ext: Option<Vec<String>>,
 
-    /// Match files containing this string
-    #[arg(short = 'c', long)]
-    contains: Option<String>,
+    /// Match filename substring (repeatable)
+    #[arg(short = 'n', long = "name")]
+    name_filter: Vec<String>,
 
     /// Match files starting with this prefix
     #[arg(short = 'p', long)]
@@ -53,34 +62,34 @@ struct Cli {
     no_default_prunes: bool,
 
     /// Additional directory names to exclude (comma-separated)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(short = 'x', long, value_delimiter = ',')]
     exclude_dir: Option<Vec<String>>,
 
     /// Path to ignore config file (defaults to <scan-root>/.file-search-ignore)
     #[arg(long)]
     ignore_config: Option<String>,
 
-    /// Stop after returning this many matches
+    /// Stop after returning this many content matches
     #[arg(long)]
-    max_results: Option<usize>,
+    limit: Option<usize>,
 
-    /// Search literal text via live filesystem scan (no persistent index)
-    #[arg(long)]
-    content_search: Option<String>,
+    /// Search literal text inside files via live scan
+    #[arg(short = 't', long)]
+    text: Option<String>,
 
-    /// Max file size for content search (bytes)
-    #[arg(long, default_value_t = 8 * 1024 * 1024)]
-    content_max_file_size: u64,
+    /// Max file size for text search (bytes)
+    #[arg(short = 'm', long, default_value_t = 8 * 1024 * 1024)]
+    max_size: u64,
 
-    /// Include binary files in content search
-    #[arg(long)]
-    content_include_binary: bool,
+    /// Include binary files in text search
+    #[arg(short = 'b', long)]
+    binary: bool,
 
-    /// Number of worker threads for live content search (0 = auto)
-    #[arg(long, default_value_t = 0)]
-    content_workers: usize,
+    /// Worker threads for text search (0 = auto)
+    #[arg(short = 'w', long, default_value_t = 0)]
+    workers: usize,
 
-    /// Quiet mode - only output file paths or count
+    /// Suppress diagnostic stderr output (including --stats)
     #[arg(short, long)]
     quiet: bool,
 }
@@ -164,13 +173,39 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+#[inline]
+fn clamp_list_path_segments(path: &str, root: &Path, segments: usize) -> String {
+    let Ok(relative) = Path::new(path).strip_prefix(root) else {
+        return path.to_string();
+    };
+    let mut out = root.to_path_buf();
+    for comp in relative.components().take(segments) {
+        out.push(comp.as_os_str());
+    }
+    out.to_string_lossy().to_string()
+}
+
 fn run() -> io::Result<()> {
     let cli = Cli::parse();
+    if cli.segments.is_some() && !cli.list {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--segments requires --list",
+        ));
+    }
+    let mut path_arg = cli.path.clone();
+    let mut implicit_name: Option<String> = None;
+    if cli.name.is_none() && !path_arg.contains('/') {
+        let candidate_path = PathBuf::from(&path_arg);
+        if !candidate_path.exists() {
+            implicit_name = Some(path_arg.clone());
+            path_arg = ".".to_string();
+        }
+    }
 
-    // Build filter from CLI options
-    let filter = if let Some(exts) = &cli.ext {
-        let normalized: Vec<Box<[u8]>> = exts
-            .iter()
+    // Build filter from CLI options (all supplied clauses are AND-ed together)
+    let extensions = cli.ext.as_ref().map(|exts| {
+        exts.iter()
             .map(|e| {
                 e.trim_start_matches('.')
                     .to_ascii_lowercase()
@@ -178,21 +213,48 @@ fn run() -> io::Result<()> {
                     .into_boxed_slice()
             })
             .filter(|e| !e.is_empty())
-            .collect();
-        FileFilter::Extensions(normalized)
-    } else if let Some(pattern) = &cli.contains {
-        FileFilter::Contains(pattern.to_ascii_lowercase().into_bytes().into_boxed_slice())
-    } else if let Some(prefix) = &cli.prefix {
-        FileFilter::Prefix(prefix.to_ascii_lowercase().into_bytes().into_boxed_slice())
-    } else if let Some(suffix) = &cli.suffix {
-        FileFilter::Suffix(suffix.to_ascii_lowercase().into_bytes().into_boxed_slice())
-    } else {
-        FileFilter::All
-    };
+            .collect::<Vec<_>>()
+    });
+    let mut contains_all: Vec<Box<[u8]>> = Vec::new();
+    if let Some(term) = &implicit_name {
+        if !term.is_empty() {
+            contains_all.push(term.to_ascii_lowercase().into_bytes().into_boxed_slice());
+        }
+    }
+    if let Some(term) = &cli.name {
+        if !term.is_empty() {
+            contains_all.push(term.to_ascii_lowercase().into_bytes().into_boxed_slice());
+        }
+    }
+    for term in &cli.name_filter {
+        if !term.is_empty() {
+            contains_all.push(term.to_ascii_lowercase().into_bytes().into_boxed_slice());
+        }
+    }
+    let prefix = cli
+        .prefix
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase().into_bytes().into_boxed_slice());
+    let suffix = cli
+        .suffix
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase().into_bytes().into_boxed_slice());
+
+    let filter =
+        if extensions.is_some() || !contains_all.is_empty() || prefix.is_some() || suffix.is_some()
+        {
+            FileFilter::Composite {
+                extensions,
+                contains_all,
+                prefix,
+                suffix,
+            }
+        } else {
+            FileFilter::All
+        };
 
     // Resolve to absolute path
-    let path =
-        std::fs::canonicalize(&cli.path).unwrap_or_else(|_| std::path::PathBuf::from(&cli.path));
+    let path = std::fs::canonicalize(&path_arg).unwrap_or_else(|_| PathBuf::from(&path_arg));
     let path_str = path.to_string_lossy().to_string();
 
     let mut ignore_dir_names = cli.exclude_dir.clone().unwrap_or_default();
@@ -235,34 +297,32 @@ fn run() -> io::Result<()> {
         ignore_path_prefixes,
     };
 
-    if let Some(needle) = &cli.content_search {
-        if !cli.quiet {
-            eprintln!("Content search via live scan: {}", path_str);
-        }
+    if let Some(needle) = &cli.text {
         let query = query_content_live(
             &path,
             cli.depth,
             scan_options,
+            filter.clone(),
             needle,
             cli.list,
-            cli.max_results,
-            cli.content_max_file_size,
-            cli.content_include_binary,
-            cli.content_workers,
+            cli.segments,
+            cli.limit,
+            cli.max_size,
+            cli.binary,
+            cli.workers,
         )?;
-        if !cli.quiet {
-            eprintln!(
-                "\nFound {} matching files in {:.2?} ({} candidates)",
-                query.matches, query.duration, query.candidates
-            );
-        } else if !cli.list {
+
+        if !cli.list {
             println!("{}", query.matches);
         }
-        return Ok(());
-    }
 
-    if !cli.quiet {
-        eprintln!("Scanning: {}", path_str);
+        if cli.stats && !cli.quiet {
+            eprintln!(
+                "Found {} matching files in {:.2?} ({} candidates)",
+                query.matches, query.duration, query.candidates
+            );
+        }
+        return Ok(());
     }
 
     let handle = scan(&path_str, cli.list, cli.depth, filter, scan_options);
@@ -270,6 +330,11 @@ fn run() -> io::Result<()> {
     let mut total: usize = 0;
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
+    let mut clamped_seen = if cli.list && cli.segments.is_some() {
+        Some(HashSet::<String>::new())
+    } else {
+        None
+    };
 
     for batch in &handle.receiver {
         match batch {
@@ -277,9 +342,19 @@ fn run() -> io::Result<()> {
                 total += n;
             }
             ResultBatch::Paths(paths) => {
-                total += paths.len();
-                for p in paths {
-                    let _ = writeln!(writer, "{}", p);
+                if let Some(seen) = clamped_seen.as_mut() {
+                    for p in paths {
+                        total += 1;
+                        let clamped = clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
+                        if seen.insert(clamped.clone()) {
+                            let _ = writeln!(writer, "{}", clamped);
+                        }
+                    }
+                } else {
+                    total += paths.len();
+                    for p in paths {
+                        let _ = writeln!(writer, "{}", p);
+                    }
                 }
             }
         }
@@ -288,14 +363,13 @@ fn run() -> io::Result<()> {
 
     let stats = handle.wait_for_completion();
 
-    if !cli.quiet {
-        eprintln!("\nFound {} files in {:.2?}", total, stats.duration);
-    } else if !cli.list {
+    if !cli.list {
         println!("{}", total);
     }
 
-    if cli.stats {
-        eprintln!("\n--- Statistics ---");
+    if cli.stats && !cli.quiet {
+        eprintln!("Found {} files in {:.2?}", total, stats.duration);
+        eprintln!("--- Statistics ---");
         eprintln!("getattrlistbulk calls: {}", stats.getattr_calls);
         eprintln!("entries returned:      {}", stats.getattr_entries);
         eprintln!("avg entries/call:      {:.1}", stats.avg_entries_per_call());
