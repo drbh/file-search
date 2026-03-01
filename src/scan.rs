@@ -124,21 +124,26 @@ unsafe fn timed_openat(
     path: *const i8,
     oflag: i32,
     absolute: bool,
+    collect_syscall_stats: bool,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    let start = Instant::now();
-    let fd = openat(dfd, path, oflag);
-    stats.openat_calls += 1;
-    if absolute {
-        stats.openat_abs_calls += 1;
+    if collect_syscall_stats {
+        let start = Instant::now();
+        let fd = openat(dfd, path, oflag);
+        stats.openat_calls += 1;
+        if absolute {
+            stats.openat_abs_calls += 1;
+        } else {
+            stats.openat_rel_calls += 1;
+        }
+        if fd < 0 {
+            stats.openat_fails += 1;
+        }
+        stats.openat_nanos += start.elapsed().as_nanos() as u64;
+        fd
     } else {
-        stats.openat_rel_calls += 1;
+        openat(dfd, path, oflag)
     }
-    if fd < 0 {
-        stats.openat_fails += 1;
-    }
-    stats.openat_nanos += start.elapsed().as_nanos() as u64;
-    fd
 }
 
 #[inline]
@@ -147,29 +152,38 @@ unsafe fn timed_getattrlistbulk(
     al: *const attrlist,
     buf: *mut core::ffi::c_void,
     size: usize,
+    collect_syscall_stats: bool,
     stats: &mut LocalSysStats,
 ) -> isize {
-    let start = Instant::now();
-    let n = getattrlistbulk(dirfd, al, buf, size, 0);
-    stats.getattr_calls += 1;
-    if n > 0 {
-        stats.getattr_entries += n as u64;
-    } else if n < 0 {
-        stats.getattr_errors += 1;
+    if collect_syscall_stats {
+        let start = Instant::now();
+        let n = getattrlistbulk(dirfd, al, buf, size, 0);
+        stats.getattr_calls += 1;
+        if n > 0 {
+            stats.getattr_entries += n as u64;
+        } else if n < 0 {
+            stats.getattr_errors += 1;
+        }
+        stats.getattr_nanos += start.elapsed().as_nanos() as u64;
+        n
+    } else {
+        getattrlistbulk(dirfd, al, buf, size, 0)
     }
-    stats.getattr_nanos += start.elapsed().as_nanos() as u64;
-    n
 }
 
 #[inline]
-unsafe fn timed_set_rdahead(fd: i32, stats: &mut LocalSysStats) {
-    let start = Instant::now();
-    let rc = fcntl(fd, F_RDAHEAD, 1);
-    stats.rdahead_calls += 1;
-    if rc < 0 {
-        stats.rdahead_fails += 1;
+unsafe fn timed_set_rdahead(fd: i32, collect_syscall_stats: bool, stats: &mut LocalSysStats) {
+    if collect_syscall_stats {
+        let start = Instant::now();
+        let rc = fcntl(fd, F_RDAHEAD, 1);
+        stats.rdahead_calls += 1;
+        if rc < 0 {
+            stats.rdahead_fails += 1;
+        }
+        stats.rdahead_nanos += start.elapsed().as_nanos() as u64;
+    } else {
+        let _ = fcntl(fd, F_RDAHEAD, 1);
     }
-    stats.rdahead_nanos += start.elapsed().as_nanos() as u64;
 }
 
 #[derive(Clone)]
@@ -524,6 +538,7 @@ unsafe fn worker(
     max_depth: usize,
     filter: FileFilter,
     scan_options: Arc<ScanOptions>,
+    collect_syscall_stats: bool,
 ) {
     // Thread-local reusable buffers
     let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
@@ -575,6 +590,7 @@ unsafe fn worker(
                     dir_cbuf.as_ptr() as *const i8,
                     O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                     true,
+                    collect_syscall_stats,
                     &mut sys_stats,
                 );
                 if fd < 0 {
@@ -588,7 +604,7 @@ unsafe fn worker(
 
         // Enable directory read-ahead for better performance
         if enable_rdahead {
-            timed_set_rdahead(dirfd, &mut sys_stats);
+            timed_set_rdahead(dirfd, collect_syscall_stats, &mut sys_stats);
         }
 
         loop {
@@ -597,6 +613,7 @@ unsafe fn worker(
                 &al,
                 buf.as_mut_ptr().cast(),
                 buf.len(),
+                collect_syscall_stats,
                 &mut sys_stats,
             );
             if n < 0 {
@@ -666,6 +683,7 @@ unsafe fn worker(
                             name_cbuf.as_ptr() as *const i8,
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                             false,
+                            collect_syscall_stats,
                             &mut sys_stats,
                         );
                         if cfd >= 0 {
@@ -688,7 +706,9 @@ unsafe fn worker(
                         if let WorkMsg::Dir(failed_child) = err.0 {
                             if let Some(fd) = failed_child.dirfd {
                                 let _ = close(fd);
-                                sys_stats.close_calls += 1;
+                                if collect_syscall_stats {
+                                    sys_stats.close_calls += 1;
+                                }
                                 fd_budget.release();
                             }
                         }
@@ -724,7 +744,9 @@ unsafe fn worker(
         }
 
         let _ = close(dirfd);
-        sys_stats.close_calls += 1;
+        if collect_syscall_stats {
+            sys_stats.close_calls += 1;
+        }
         if held_fd {
             fd_budget.release();
         }
@@ -743,7 +765,9 @@ unsafe fn worker(
         let _ = result_tx.send(ResultBatch::Count(pending_count));
     }
 
-    flush_local_sys_stats(&sys_stats);
+    if collect_syscall_stats {
+        flush_local_sys_stats(&sys_stats);
+    }
 }
 
 fn detect_fd_limit() -> usize {
@@ -857,6 +881,7 @@ pub fn scan(
     max_depth: usize,
     filter: FileFilter,
     options: ScanOptions,
+    collect_syscall_stats: bool,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
 
@@ -898,10 +923,13 @@ pub fn scan(
             root_c.as_ptr() as *const i8,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
             true,
+            collect_syscall_stats,
             &mut root_stats,
         );
         if fd < 0 {
-            flush_local_sys_stats(&root_stats);
+            if collect_syscall_stats {
+                flush_local_sys_stats(&root_stats);
+            }
             eprintln!("cannot open root: {root_path}");
             let (_, rx) = unbounded::<ResultBatch>();
             return ScanHandle {
@@ -931,7 +959,17 @@ pub fn scan(
         let opts = scan_options.clone();
         handles.push(std::thread::spawn(move || unsafe {
             worker(
-                rx, tx, rtx, ac, fd_mgr, workers, list_mode, max_depth, flt, opts,
+                rx,
+                tx,
+                rtx,
+                ac,
+                fd_mgr,
+                workers,
+                list_mode,
+                max_depth,
+                flt,
+                opts,
+                collect_syscall_stats,
             )
         }));
     }
@@ -953,14 +991,18 @@ pub fn scan(
         })
     } else {
         let _ = unsafe { close(root_fd) };
-        root_stats.close_calls += 1;
+        if collect_syscall_stats {
+            root_stats.close_calls += 1;
+        }
         WorkMsg::Dir(WorkItem {
             path: root_path,
             dirfd: None,
             depth: 1,
         })
     };
-    flush_local_sys_stats(&root_stats);
+    if collect_syscall_stats {
+        flush_local_sys_stats(&root_stats);
+    }
     work_tx.send(root_item).unwrap();
     drop(work_tx); // allow workers to terminate when queue drains
 

@@ -317,6 +317,7 @@ pub fn query_content_live(
     max_file_size: u64,
     include_binary: bool,
     requested_workers: usize,
+    collect_scan_stats: bool,
 ) -> io::Result<ContentQueryStats> {
     if needle.is_empty() {
         return Err(io::Error::new(
@@ -328,7 +329,14 @@ pub fn query_content_live(
     let started = Instant::now();
     let workers = resolve_content_workers(requested_workers);
     let root_str = root.to_string_lossy().to_string();
-    let scan_handle = scan(&root_str, true, max_depth, file_filter, scan_options);
+    let scan_handle = scan(
+        &root_str,
+        true,
+        max_depth,
+        file_filter,
+        scan_options,
+        collect_scan_stats,
+    );
     let (work_tx, work_rx) = channel::bounded::<String>(workers.saturating_mul(1024).max(1024));
 
     let needle = Arc::new(needle.as_bytes().to_vec());

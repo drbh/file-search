@@ -310,6 +310,7 @@ fn run() -> io::Result<()> {
             cli.max_size,
             cli.binary,
             cli.workers,
+            cli.stats,
         )?;
 
         if !cli.list {
@@ -341,7 +342,14 @@ fn run() -> io::Result<()> {
         return Ok(());
     }
 
-    let handle = scan(&path_str, cli.list, cli.depth, filter, scan_options);
+    let handle = scan(
+        &path_str,
+        cli.list,
+        cli.depth,
+        filter,
+        scan_options,
+        cli.stats,
+    );
 
     let mut total: usize = 0;
     let stdout = io::stdout();
