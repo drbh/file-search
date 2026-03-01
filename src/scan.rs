@@ -84,20 +84,60 @@ static RDAHEAD_FAILS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_NANOS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default)]
+struct LocalSysStats {
+    getattr_calls: u64,
+    getattr_entries: u64,
+    getattr_errors: u64,
+    openat_calls: u64,
+    openat_abs_calls: u64,
+    openat_rel_calls: u64,
+    openat_fails: u64,
+    openat_nanos: u64,
+    getattr_nanos: u64,
+    rdahead_calls: u64,
+    rdahead_fails: u64,
+    rdahead_nanos: u64,
+    close_calls: u64,
+}
+
 #[inline]
-unsafe fn timed_openat(dfd: i32, path: *const i8, oflag: i32, absolute: bool) -> i32 {
+fn flush_local_sys_stats(stats: &LocalSysStats) {
+    GETATTR_CALLS.fetch_add(stats.getattr_calls, Ordering::Relaxed);
+    GETATTR_ENTRIES.fetch_add(stats.getattr_entries, Ordering::Relaxed);
+    GETATTR_ERRORS.fetch_add(stats.getattr_errors, Ordering::Relaxed);
+    OPENAT_CALLS.fetch_add(stats.openat_calls, Ordering::Relaxed);
+    OPENAT_ABS_CALLS.fetch_add(stats.openat_abs_calls, Ordering::Relaxed);
+    OPENAT_REL_CALLS.fetch_add(stats.openat_rel_calls, Ordering::Relaxed);
+    OPENAT_FAILS.fetch_add(stats.openat_fails, Ordering::Relaxed);
+    OPENAT_NANOS.fetch_add(stats.openat_nanos, Ordering::Relaxed);
+    GETATTR_NANOS.fetch_add(stats.getattr_nanos, Ordering::Relaxed);
+    RDAHEAD_CALLS.fetch_add(stats.rdahead_calls, Ordering::Relaxed);
+    RDAHEAD_FAILS.fetch_add(stats.rdahead_fails, Ordering::Relaxed);
+    RDAHEAD_NANOS.fetch_add(stats.rdahead_nanos, Ordering::Relaxed);
+    CLOSE_CALLS.fetch_add(stats.close_calls, Ordering::Relaxed);
+}
+
+#[inline]
+unsafe fn timed_openat(
+    dfd: i32,
+    path: *const i8,
+    oflag: i32,
+    absolute: bool,
+    stats: &mut LocalSysStats,
+) -> i32 {
     let start = Instant::now();
     let fd = openat(dfd, path, oflag);
-    OPENAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    stats.openat_calls += 1;
     if absolute {
-        OPENAT_ABS_CALLS.fetch_add(1, Ordering::Relaxed);
+        stats.openat_abs_calls += 1;
     } else {
-        OPENAT_REL_CALLS.fetch_add(1, Ordering::Relaxed);
+        stats.openat_rel_calls += 1;
     }
     if fd < 0 {
-        OPENAT_FAILS.fetch_add(1, Ordering::Relaxed);
+        stats.openat_fails += 1;
     }
-    OPENAT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats.openat_nanos += start.elapsed().as_nanos() as u64;
     fd
 }
 
@@ -107,28 +147,29 @@ unsafe fn timed_getattrlistbulk(
     al: *const attrlist,
     buf: *mut core::ffi::c_void,
     size: usize,
+    stats: &mut LocalSysStats,
 ) -> isize {
     let start = Instant::now();
     let n = getattrlistbulk(dirfd, al, buf, size, 0);
-    GETATTR_CALLS.fetch_add(1, Ordering::Relaxed);
+    stats.getattr_calls += 1;
     if n > 0 {
-        GETATTR_ENTRIES.fetch_add(n as u64, Ordering::Relaxed);
+        stats.getattr_entries += n as u64;
     } else if n < 0 {
-        GETATTR_ERRORS.fetch_add(1, Ordering::Relaxed);
+        stats.getattr_errors += 1;
     }
-    GETATTR_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats.getattr_nanos += start.elapsed().as_nanos() as u64;
     n
 }
 
 #[inline]
-unsafe fn timed_set_rdahead(fd: i32) {
+unsafe fn timed_set_rdahead(fd: i32, stats: &mut LocalSysStats) {
     let start = Instant::now();
     let rc = fcntl(fd, F_RDAHEAD, 1);
-    RDAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+    stats.rdahead_calls += 1;
     if rc < 0 {
-        RDAHEAD_FAILS.fetch_add(1, Ordering::Relaxed);
+        stats.rdahead_fails += 1;
     }
-    RDAHEAD_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats.rdahead_nanos += start.elapsed().as_nanos() as u64;
 }
 
 #[derive(Clone)]
@@ -437,8 +478,7 @@ impl FileFilter {
     }
 
     #[inline]
-    pub fn matches(&self, name: &str) -> bool {
-        let name_bytes = name.as_bytes();
+    pub fn matches_bytes(&self, name_bytes: &[u8]) -> bool {
         match self {
             FileFilter::All => true,
             FileFilter::Composite {
@@ -487,6 +527,8 @@ unsafe fn worker(
 ) {
     // Thread-local reusable buffers
     let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
+    let mut sys_stats = LocalSysStats::default();
+    let enable_rdahead = std::env::var_os("FILE_SEARCH_DISABLE_RDAHEAD").is_none();
 
     // Only request what we need: NAME + OBJTYPE + RETURNED_ATTRS (required for getattrlistbulk)
     let al = attrlist {
@@ -533,6 +575,7 @@ unsafe fn worker(
                     dir_cbuf.as_ptr() as *const i8,
                     O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                     true,
+                    &mut sys_stats,
                 );
                 if fd < 0 {
                     mark_work_complete(&active_count, &work_tx, workers);
@@ -544,10 +587,18 @@ unsafe fn worker(
         path_buf.set_base(&path);
 
         // Enable directory read-ahead for better performance
-        timed_set_rdahead(dirfd);
+        if enable_rdahead {
+            timed_set_rdahead(dirfd, &mut sys_stats);
+        }
 
         loop {
-            let n = timed_getattrlistbulk(dirfd, &al, buf.as_mut_ptr().cast(), buf.len());
+            let n = timed_getattrlistbulk(
+                dirfd,
+                &al,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut sys_stats,
+            );
             if n < 0 {
                 // syscall error; stop scanning this directory
                 break;
@@ -586,15 +637,14 @@ unsafe fn worker(
                     name_bytes
                 };
 
-                // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
-                let name = std::str::from_utf8_unchecked(name_bytes);
-
-                if name == "." || name == ".." {
+                if name_bytes == b"." || name_bytes == b".." {
                     p += reclen;
                     continue;
                 }
 
                 if objtype == VDIR {
+                    // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                    let name = std::str::from_utf8_unchecked(name_bytes);
                     if scan_options.should_skip_dir(&path, name) {
                         p += reclen;
                         continue;
@@ -616,6 +666,7 @@ unsafe fn worker(
                             name_cbuf.as_ptr() as *const i8,
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                             false,
+                            &mut sys_stats,
                         );
                         if cfd >= 0 {
                             next_fd = Some(cfd);
@@ -637,13 +688,16 @@ unsafe fn worker(
                         if let WorkMsg::Dir(failed_child) = err.0 {
                             if let Some(fd) = failed_child.dirfd {
                                 let _ = close(fd);
+                                sys_stats.close_calls += 1;
                                 fd_budget.release();
                             }
                         }
                         mark_work_complete(&active_count, &work_tx, workers);
                     }
-                } else if objtype == VREG && filter.matches(name) {
+                } else if objtype == VREG && filter.matches_bytes(name_bytes) {
                     if list_mode {
+                        // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                        let name = std::str::from_utf8_unchecked(name_bytes);
                         let composed = path_buf.compose(name).to_owned();
                         pending_paths.push(composed);
                         if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
@@ -670,7 +724,7 @@ unsafe fn worker(
         }
 
         let _ = close(dirfd);
-        CLOSE_CALLS.fetch_add(1, Ordering::Relaxed);
+        sys_stats.close_calls += 1;
         if held_fd {
             fd_budget.release();
         }
@@ -688,6 +742,8 @@ unsafe fn worker(
     } else if pending_count != 0 {
         let _ = result_tx.send(ResultBatch::Count(pending_count));
     }
+
+    flush_local_sys_stats(&sys_stats);
 }
 
 fn detect_fd_limit() -> usize {
@@ -699,6 +755,24 @@ fn detect_fd_limit() -> usize {
     };
     base.saturating_sub(FD_HEADROOM)
         .clamp(FD_MIN_LIMIT, FD_MAX_LIMIT)
+}
+
+fn resolve_scan_workers() -> usize {
+    if let Ok(raw) = std::env::var("FILE_SEARCH_SCAN_WORKERS") {
+        if let Ok(parsed) = raw.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    if cfg!(target_arch = "aarch64") {
+        cores.min(7).max(2)
+    } else {
+        cores.min(8).max(2)
+    }
 }
 
 /// Runtime statistics from scanning
@@ -817,14 +891,17 @@ pub fn scan(
     let fd_budget = Arc::new(FdBudget::new(fd_limit));
 
     // Ensure root directory can be opened up-front
+    let mut root_stats = LocalSysStats::default();
     let root_fd = unsafe {
         let fd = timed_openat(
             AT_FDCWD,
             root_c.as_ptr() as *const i8,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
             true,
+            &mut root_stats,
         );
         if fd < 0 {
+            flush_local_sys_stats(&root_stats);
             eprintln!("cannot open root: {root_path}");
             let (_, rx) = unbounded::<ResultBatch>();
             return ScanHandle {
@@ -836,11 +913,7 @@ pub fn scan(
     };
 
     // Worker count: cap to 8; avoid extra contention on APFS metadata
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8)
-        .max(2);
+    let workers = resolve_scan_workers();
 
     let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
@@ -880,12 +953,14 @@ pub fn scan(
         })
     } else {
         let _ = unsafe { close(root_fd) };
+        root_stats.close_calls += 1;
         WorkMsg::Dir(WorkItem {
             path: root_path,
             dirfd: None,
             depth: 1,
         })
     };
+    flush_local_sys_stats(&root_stats);
     work_tx.send(root_item).unwrap();
     drop(work_tx); // allow workers to terminate when queue drains
 
