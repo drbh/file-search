@@ -1,10 +1,8 @@
 mod content;
-mod index;
 mod scan;
 
 use clap::Parser;
-use content::{build_content_index, content_index_status, query_content_index, query_content_live};
-use index::{build_index, compact_index, index_status, query_index, watch_index};
+use content::query_content_live;
 use scan::{scan, FileFilter, ResultBatch, ScanOptions};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -62,59 +60,23 @@ struct Cli {
     #[arg(long)]
     ignore_config: Option<String>,
 
-    /// Query using on-disk index instead of live filesystem walk
-    #[arg(long)]
-    use_index: bool,
-
-    /// Build or rebuild index from a full scan
-    #[arg(long)]
-    index_build: bool,
-
-    /// Compact snapshot + delta log into a new snapshot
-    #[arg(long)]
-    index_compact: bool,
-
-    /// Show index status
-    #[arg(long)]
-    index_status: bool,
-
-    /// Watch filesystem changes and append to index delta log
-    #[arg(long)]
-    index_watch: bool,
-
-    /// Disable automatic compaction of large delta logs during indexed query
-    #[arg(long)]
-    no_index_auto_compact: bool,
-
     /// Stop after returning this many matches
     #[arg(long)]
     max_results: Option<usize>,
 
-    /// Build or rebuild content trigram index
-    #[arg(long)]
-    content_index_build: bool,
-
-    /// Search literal text within files using content index
+    /// Search literal text via live filesystem scan (no persistent index)
     #[arg(long)]
     content_search: Option<String>,
 
-    /// Search literal text via live filesystem scan (no persistent index)
-    #[arg(long)]
-    content_search_live: Option<String>,
-
-    /// Show content index status
-    #[arg(long)]
-    content_index_status: bool,
-
-    /// Max file size for content indexing (bytes)
+    /// Max file size for content search (bytes)
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     content_max_file_size: u64,
 
-    /// Include binary files in content index/search
+    /// Include binary files in content search
     #[arg(long)]
     content_include_binary: bool,
 
-    /// Number of worker threads for content indexing (0 = auto)
+    /// Number of worker threads for live content search (0 = auto)
     #[arg(long, default_value_t = 0)]
     content_workers: usize,
 
@@ -273,124 +235,7 @@ fn run() -> io::Result<()> {
         ignore_path_prefixes,
     };
 
-    let mode_count = usize::from(cli.use_index)
-        + usize::from(cli.index_build)
-        + usize::from(cli.index_compact)
-        + usize::from(cli.index_status)
-        + usize::from(cli.index_watch)
-        + usize::from(cli.content_index_build)
-        + usize::from(cli.content_index_status)
-        + usize::from(cli.content_search.is_some())
-        + usize::from(cli.content_search_live.is_some());
-    if mode_count > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "choose at most one index mode flag",
-        ));
-    }
-
-    if cli.index_build {
-        let build = build_index(&path, cli.depth, scan_options)?;
-        if !cli.quiet {
-            eprintln!("Indexed root: {}", path_str);
-            eprintln!("files indexed: {}", build.files);
-            eprintln!("scan duration: {:.2?}", build.scan_duration);
-            eprintln!("total duration: {:.2?}", build.total_duration);
-            eprintln!("snapshot bytes: {}", build.snapshot_bytes);
-            eprintln!("index dir: {}", build.index_dir.display());
-        }
-        return Ok(());
-    }
-
-    if cli.index_compact {
-        let compact = compact_index(&path)?;
-        if !cli.quiet {
-            eprintln!("Compacted index for {}", path_str);
-            eprintln!("files: {}", compact.files);
-            eprintln!("duration: {:.2?}", compact.duration);
-            eprintln!("snapshot bytes: {}", compact.snapshot_bytes);
-        }
-        return Ok(());
-    }
-
-    if cli.index_status {
-        let status = index_status(&path)?;
-        eprintln!("root: {}", status.root);
-        eprintln!("index dir: {}", status.index_dir.display());
-        eprintln!("snapshot exists: {}", status.snapshot_exists);
-        eprintln!("snapshot files: {}", status.snapshot_files);
-        eprintln!("snapshot size: {}", status.snapshot_size_bytes);
-        eprintln!("snapshot created unix: {}", status.snapshot_created_unix);
-        eprintln!("delta exists: {}", status.delta_exists);
-        eprintln!("delta size: {}", status.delta_size_bytes);
-        eprintln!("delta ops: {}", status.delta_ops);
-        return Ok(());
-    }
-
-    if cli.index_watch {
-        if !cli.quiet {
-            eprintln!("Starting index watcher for {}", path_str);
-        }
-        watch_index(&path)?;
-        return Ok(());
-    }
-
-    if cli.content_index_build {
-        let build = build_content_index(
-            &path,
-            cli.depth,
-            scan_options,
-            cli.content_max_file_size,
-            cli.content_include_binary,
-            cli.content_workers,
-        )?;
-        if !cli.quiet {
-            eprintln!("Built content index for {}", path_str);
-            eprintln!("workers: {}", build.workers);
-            eprintln!("files scanned: {}", build.files_scanned);
-            eprintln!("files indexed: {}", build.files_indexed);
-            eprintln!("skipped binary: {}", build.files_skipped_binary);
-            eprintln!("skipped too large: {}", build.files_skipped_too_large);
-            eprintln!("bytes indexed: {}", build.total_bytes_indexed);
-            eprintln!("scan duration: {:.2?}", build.scan_duration);
-            eprintln!("total duration: {:.2?}", build.total_duration);
-            eprintln!("snapshot bytes: {}", build.snapshot_bytes);
-            eprintln!("index dir: {}", build.index_dir.display());
-        }
-        return Ok(());
-    }
-
-    if cli.content_index_status {
-        let status = content_index_status(&path)?;
-        eprintln!("root: {}", status.root);
-        eprintln!("index dir: {}", status.index_dir.display());
-        eprintln!("snapshot exists: {}", status.snapshot_exists);
-        eprintln!("files indexed: {}", status.files_indexed);
-        eprintln!("grams indexed: {}", status.grams_indexed);
-        eprintln!("snapshot size: {}", status.snapshot_size_bytes);
-        eprintln!("snapshot created unix: {}", status.snapshot_created_unix);
-        eprintln!("include binary: {}", status.include_binary);
-        eprintln!("max file size: {}", status.max_file_size);
-        return Ok(());
-    }
-
     if let Some(needle) = &cli.content_search {
-        if !cli.quiet {
-            eprintln!("Content search via index: {}", path_str);
-        }
-        let query = query_content_index(&path, needle, cli.list, cli.max_results)?;
-        if !cli.quiet {
-            eprintln!(
-                "\nFound {} matching files in {:.2?} ({} candidates)",
-                query.matches, query.duration, query.candidates
-            );
-        } else if !cli.list {
-            println!("{}", query.matches);
-        }
-        return Ok(());
-    }
-
-    if let Some(needle) = &cli.content_search_live {
         if !cli.quiet {
             eprintln!("Content search via live scan: {}", path_str);
         }
@@ -412,28 +257,6 @@ fn run() -> io::Result<()> {
             );
         } else if !cli.list {
             println!("{}", query.matches);
-        }
-        return Ok(());
-    }
-
-    if cli.use_index {
-        if !cli.quiet {
-            eprintln!("Querying index: {}", path_str);
-        }
-        let query = query_index(
-            &path,
-            &filter,
-            cli.list,
-            cli.max_results,
-            !cli.no_index_auto_compact,
-        )?;
-        if !cli.quiet {
-            eprintln!("\nFound {} files in {:.2?}", query.files, query.duration);
-            if query.auto_compacted {
-                eprintln!("(auto-compacted delta log)");
-            }
-        } else if !cli.list {
-            println!("{}", query.files);
         }
         return Ok(());
     }

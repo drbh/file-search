@@ -6,9 +6,6 @@ edition = "2021"
 [dependencies]
 crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive"] }
-memmap2 = "0.9"
-notify = "6"
-ahash = "0.8"
 
 [profile.release]
 lto = true
