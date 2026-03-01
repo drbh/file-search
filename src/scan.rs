@@ -65,6 +65,7 @@ const FD_MIN_LIMIT: usize = 64;
 const FD_MAX_LIMIT: usize = 65536;
 const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
 const PATH_RESULT_BATCH_SIZE: usize = 4096;
+const LOCAL_WORK_STACK_LIMIT: usize = 8;
 
 // Darwin vtype constants
 const VREG: u32 = 1;
@@ -560,12 +561,17 @@ unsafe fn worker(
     let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
+    let mut local_stack: Vec<WorkItem> = Vec::with_capacity(LOCAL_WORK_STACK_LIMIT);
 
     loop {
-        let work = match work_rx.recv() {
-            Ok(WorkMsg::Dir(w)) => w,
-            Ok(WorkMsg::Shutdown) => break,
-            Err(_) => break,
+        let work = if let Some(local) = local_stack.pop() {
+            local
+        } else {
+            match work_rx.recv() {
+                Ok(WorkMsg::Dir(w)) => w,
+                Ok(WorkMsg::Shutdown) => break,
+                Err(_) => break,
+            }
         };
 
         let WorkItem { path, dirfd, depth } = work;
@@ -702,7 +708,9 @@ unsafe fn worker(
                         dirfd: next_fd,
                         depth: next_depth,
                     };
-                    if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
+                    if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
+                        local_stack.push(child);
+                    } else if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
                         if let WorkMsg::Dir(failed_child) = err.0 {
                             if let Some(fd) = failed_child.dirfd {
                                 let _ = close(fd);
