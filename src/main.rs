@@ -321,6 +321,22 @@ fn run() -> io::Result<()> {
                 "Found {} matching files in {:.2?} ({} candidates)",
                 query.matches, query.duration, query.candidates
             );
+            let gib = query.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0);
+            eprintln!(
+                "scan: {:.2?} | dispatch: {:.2?} | join: {:.2?}",
+                query.scan_duration, query.dispatch_duration, query.worker_join_duration
+            );
+            eprintln!(
+                "files seen/opened: {}/{} | read: {:.2} GiB ({} calls) | skipped too_large/binary: {}/{} | io errors open/read: {}/{}",
+                query.files_seen,
+                query.files_opened,
+                gib,
+                query.read_calls,
+                query.skipped_too_large,
+                query.skipped_binary,
+                query.open_errors,
+                query.read_errors
+            );
         }
         return Ok(());
     }
@@ -345,7 +361,8 @@ fn run() -> io::Result<()> {
                 if let Some(seen) = clamped_seen.as_mut() {
                     for p in paths {
                         total += 1;
-                        let clamped = clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
+                        let clamped =
+                            clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
                         if seen.insert(clamped.clone()) {
                             let _ = writeln!(writer, "{}", clamped);
                         }
