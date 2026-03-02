@@ -1,4 +1,5 @@
 use crate::scan::{scan, FileFilter, ResultBatch, ScanOptions};
+use crate::time_filter::MtimeFilter;
 use crossbeam_channel as channel;
 use std::collections::HashSet;
 use std::fs::File;
@@ -316,6 +317,7 @@ pub fn query_content_live(
     max_results: Option<usize>,
     max_file_size: u64,
     include_binary: bool,
+    mtime_filter: MtimeFilter,
     requested_workers: usize,
     collect_scan_stats: bool,
 ) -> io::Result<ContentQueryStats> {
@@ -367,6 +369,11 @@ pub fn query_content_live(
     drop(work_rx);
 
     let dispatch_started = Instant::now();
+    let mtime_now = if mtime_filter.is_active() {
+        Some(std::time::SystemTime::now())
+    } else {
+        None
+    };
     let mut send_failed = false;
     for batch in &scan_handle.receiver {
         if send_failed || stop.load(Ordering::Relaxed) {
@@ -376,6 +383,11 @@ pub fn query_content_live(
             for path in paths_batch {
                 if stop.load(Ordering::Relaxed) {
                     break;
+                }
+                if let Some(now) = mtime_now {
+                    if !mtime_filter.matches_path(Path::new(&path), now) {
+                        continue;
+                    }
                 }
                 if work_tx.send(path).is_err() {
                     send_failed = true;

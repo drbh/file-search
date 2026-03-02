@@ -1,5 +1,6 @@
 mod content;
 mod scan;
+mod time_filter;
 
 use clap::Parser;
 use content::query_content_live;
@@ -8,6 +9,8 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use time_filter::{parse_time_period, MtimeFilter};
 
 #[derive(Parser)]
 #[command(name = "f")]
@@ -22,7 +25,7 @@ struct Cli {
     name: Option<String>,
 
     /// List file paths instead of just counting
-    #[arg(short, long)]
+    #[arg(short = 'l', long)]
     list: bool,
 
     /// Clamp listed paths to at most N path segments below the input root and deduplicate
@@ -30,7 +33,7 @@ struct Cli {
     segments: Option<usize>,
 
     /// Maximum depth to traverse (0 = unlimited)
-    #[arg(short, long, default_value = "0")]
+    #[arg(short = 'd', long, default_value = "0")]
     depth: usize,
 
     /// File extensions to match (comma-separated, e.g., "rs,toml,md")
@@ -46,19 +49,27 @@ struct Cli {
     prefix: Option<String>,
 
     /// Match files ending with this suffix (before extension)
-    #[arg(short = 'S', long)]
+    #[arg(short = 's', long)]
     suffix: Option<String>,
 
+    /// Include files modified within this period (more recent than this age)
+    #[arg(short = 'r', long, value_parser = parse_time_period)]
+    max_age: Option<Duration>,
+
+    /// Include files modified at least this old
+    #[arg(short = 'o', long, value_parser = parse_time_period)]
+    min_age: Option<Duration>,
+
     /// Show statistics after scan
-    #[arg(short, long)]
+    #[arg(short = 'v', long)]
     stats: bool,
 
     /// Include hidden directories (names starting with '.')
-    #[arg(long)]
+    #[arg(short = 'a', long)]
     hidden: bool,
 
     /// Disable default directory pruning (.git, node_modules, target, etc.)
-    #[arg(long)]
+    #[arg(short = 'P', long)]
     no_default_prunes: bool,
 
     /// Additional directory names to exclude (comma-separated)
@@ -66,11 +77,11 @@ struct Cli {
     exclude_dir: Option<Vec<String>>,
 
     /// Path to ignore config file (defaults to <scan-root>/.file-search-ignore)
-    #[arg(long)]
+    #[arg(short = 'I', long)]
     ignore_config: Option<String>,
 
     /// Stop after returning this many content matches
-    #[arg(long)]
+    #[arg(short = 'k', long)]
     limit: Option<usize>,
 
     /// Search literal text inside files via live scan
@@ -193,6 +204,14 @@ fn run() -> io::Result<()> {
             "--segments requires --list",
         ));
     }
+    let mtime_filter = MtimeFilter {
+        newer_than: cli.max_age,
+        older_than: cli.min_age,
+    };
+    mtime_filter
+        .validate()
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+
     let mut path_arg = cli.path.clone();
     let mut implicit_name: Option<String> = None;
     if cli.name.is_none() && !path_arg.contains('/') {
@@ -309,6 +328,7 @@ fn run() -> io::Result<()> {
             cli.limit,
             cli.max_size,
             cli.binary,
+            mtime_filter,
             cli.workers,
             cli.stats,
         )?;
@@ -342,9 +362,16 @@ fn run() -> io::Result<()> {
         return Ok(());
     }
 
+    let scan_list_mode = cli.list || mtime_filter.is_active();
+    let mtime_now = if mtime_filter.is_active() {
+        Some(std::time::SystemTime::now())
+    } else {
+        None
+    };
+
     let handle = scan(
         &path_str,
-        cli.list,
+        scan_list_mode,
         cli.depth,
         filter,
         scan_options,
@@ -369,6 +396,11 @@ fn run() -> io::Result<()> {
             ResultBatch::Paths(paths) => {
                 if let Some(seen) = clamped_seen.as_mut() {
                     for p in paths {
+                        if let Some(now) = mtime_now {
+                            if !mtime_filter.matches_path(Path::new(&p), now) {
+                                continue;
+                            }
+                        }
                         total += 1;
                         let clamped =
                             clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
@@ -376,10 +408,24 @@ fn run() -> io::Result<()> {
                             let _ = writeln!(writer, "{}", clamped);
                         }
                     }
-                } else {
-                    total += paths.len();
+                } else if cli.list {
                     for p in paths {
+                        if let Some(now) = mtime_now {
+                            if !mtime_filter.matches_path(Path::new(&p), now) {
+                                continue;
+                            }
+                        }
+                        total += 1;
                         let _ = writeln!(writer, "{}", p);
+                    }
+                } else {
+                    for p in paths {
+                        if let Some(now) = mtime_now {
+                            if !mtime_filter.matches_path(Path::new(&p), now) {
+                                continue;
+                            }
+                        }
+                        total += 1;
                     }
                 }
             }
