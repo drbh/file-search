@@ -3,6 +3,10 @@ name = "file-search"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "file_search"
+path = "src/lib.rs"
+
 [[bin]]
 name = "f"
 path = "src/main.rs"

@@ -1,16 +1,12 @@
-mod content;
-mod scan;
-mod time_filter;
-
 use clap::Parser;
-use content::query_content_live;
-use scan::{scan, FileFilter, ResultBatch, ScanOptions};
+use file_search::content::query_content_live;
+use file_search::scan::{scan, FileFilter, ResultBatch, ScanOptions};
+use file_search::time_filter::{parse_time_period, MtimeFilter};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use time_filter::{parse_time_period, MtimeFilter};
 
 #[derive(Parser)]
 #[command(name = "f")]
