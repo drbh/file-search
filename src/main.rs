@@ -348,6 +348,7 @@ fn run() -> io::Result<()> {
         cli.depth,
         filter,
         scan_options,
+        None,
         cli.stats,
     );
 
@@ -411,6 +412,10 @@ fn run() -> io::Result<()> {
         eprintln!("rdahead calls:         {}", stats.rdahead_calls);
         eprintln!("rdahead failures:      {}", stats.rdahead_fails);
         eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
+        eprintln!("fd budget misses:      {}", stats.fd_budget_misses);
+        eprintln!("local stack pushes:    {}", stats.local_stack_pushes);
+        eprintln!("global queue spills:   {}", stats.global_queue_spills);
+        eprintln!("cancel-skipped dirs:   {}", stats.cancel_skipped_dirs);
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 use crossbeam_channel::unbounded;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
@@ -84,6 +84,10 @@ static RDAHEAD_CALLS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_FAILS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_NANOS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FD_BUDGET_MISSES: AtomicU64 = AtomicU64::new(0);
+static LOCAL_STACK_PUSHES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_QUEUE_SPILLS: AtomicU64 = AtomicU64::new(0);
+static CANCEL_SKIPPED_DIRS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct LocalSysStats {
@@ -100,6 +104,10 @@ struct LocalSysStats {
     rdahead_fails: u64,
     rdahead_nanos: u64,
     close_calls: u64,
+    fd_budget_misses: u64,
+    local_stack_pushes: u64,
+    global_queue_spills: u64,
+    cancel_skipped_dirs: u64,
 }
 
 #[inline]
@@ -117,6 +125,17 @@ fn flush_local_sys_stats(stats: &LocalSysStats) {
     RDAHEAD_FAILS.fetch_add(stats.rdahead_fails, Ordering::Relaxed);
     RDAHEAD_NANOS.fetch_add(stats.rdahead_nanos, Ordering::Relaxed);
     CLOSE_CALLS.fetch_add(stats.close_calls, Ordering::Relaxed);
+    FD_BUDGET_MISSES.fetch_add(stats.fd_budget_misses, Ordering::Relaxed);
+    LOCAL_STACK_PUSHES.fetch_add(stats.local_stack_pushes, Ordering::Relaxed);
+    GLOBAL_QUEUE_SPILLS.fetch_add(stats.global_queue_spills, Ordering::Relaxed);
+    CANCEL_SKIPPED_DIRS.fetch_add(stats.cancel_skipped_dirs, Ordering::Relaxed);
+}
+
+#[inline]
+fn is_cancelled(cancel_flag: &Option<Arc<AtomicBool>>) -> bool {
+    cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 #[inline]
@@ -539,6 +558,7 @@ unsafe fn worker(
     max_depth: usize,
     filter: FileFilter,
     scan_options: Arc<ScanOptions>,
+    cancel_flag: Option<Arc<AtomicBool>>,
     collect_syscall_stats: bool,
 ) {
     // Thread-local reusable buffers
@@ -562,6 +582,7 @@ unsafe fn worker(
     let mut pending_count: usize = 0;
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
     let mut local_stack: Vec<WorkItem> = Vec::with_capacity(LOCAL_WORK_STACK_LIMIT);
+    let has_cancel = cancel_flag.is_some();
 
     loop {
         let work = if let Some(local) = local_stack.pop() {
@@ -573,6 +594,21 @@ unsafe fn worker(
                 Err(_) => break,
             }
         };
+
+        if has_cancel && is_cancelled(&cancel_flag) {
+            if let Some(fd) = work.dirfd {
+                let _ = close(fd);
+                if collect_syscall_stats {
+                    sys_stats.close_calls += 1;
+                }
+                fd_budget.release();
+            }
+            if collect_syscall_stats {
+                sys_stats.cancel_skipped_dirs += 1;
+            }
+            mark_work_complete(&active_count, &work_tx, workers);
+            continue;
+        }
 
         let WorkItem { path, dirfd, depth } = work;
 
@@ -614,6 +650,9 @@ unsafe fn worker(
         }
 
         loop {
+            if has_cancel && is_cancelled(&cancel_flag) {
+                break;
+            }
             let n = timed_getattrlistbulk(
                 dirfd,
                 &al,
@@ -633,7 +672,12 @@ unsafe fn worker(
 
             // n == number of records, not bytes
             let mut p = 0usize;
+            let mut stop_dir_scan = false;
             for _ in 0..(n as usize) {
+                if has_cancel && is_cancelled(&cancel_flag) {
+                    stop_dir_scan = true;
+                    break;
+                }
                 let base = buf.as_ptr().add(p);
 
                 // [u32 reclen]
@@ -697,6 +741,8 @@ unsafe fn worker(
                         } else {
                             fd_budget.release();
                         }
+                    } else if collect_syscall_stats {
+                        sys_stats.fd_budget_misses += 1;
                     }
                     // If we can't acquire fd budget, next_fd stays None and we'll open by path later
 
@@ -709,8 +755,14 @@ unsafe fn worker(
                         depth: next_depth,
                     };
                     if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
+                        if collect_syscall_stats {
+                            sys_stats.local_stack_pushes += 1;
+                        }
                         local_stack.push(child);
                     } else if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
+                        if collect_syscall_stats {
+                            sys_stats.global_queue_spills += 1;
+                        }
                         if let WorkMsg::Dir(failed_child) = err.0 {
                             if let Some(fd) = failed_child.dirfd {
                                 let _ = close(fd);
@@ -721,6 +773,8 @@ unsafe fn worker(
                             }
                         }
                         mark_work_complete(&active_count, &work_tx, workers);
+                    } else if collect_syscall_stats {
+                        sys_stats.global_queue_spills += 1;
                     }
                 } else if objtype == VREG && filter.matches_bytes(name_bytes) {
                     if list_mode {
@@ -743,6 +797,10 @@ unsafe fn worker(
                 }
 
                 p += reclen; // advance to next record
+            }
+
+            if stop_dir_scan {
+                break;
             }
 
             if p + BULK_EXPAND_SLACK >= buf.len() && buf.len() < MAX_BULK_BUF_SIZE {
@@ -824,6 +882,10 @@ pub struct ScanStats {
     pub rdahead_fails: u64,
     pub rdahead_ms: f64,
     pub close_calls: u64,
+    pub fd_budget_misses: u64,
+    pub local_stack_pushes: u64,
+    pub global_queue_spills: u64,
+    pub cancel_skipped_dirs: u64,
 }
 
 impl ScanStats {
@@ -867,6 +929,10 @@ impl ScanHandle {
             rdahead_fails: RDAHEAD_FAILS.load(Ordering::Relaxed),
             rdahead_ms: rdahead_nanos as f64 / 1_000_000.0,
             close_calls: CLOSE_CALLS.load(Ordering::Relaxed),
+            fd_budget_misses: FD_BUDGET_MISSES.load(Ordering::Relaxed),
+            local_stack_pushes: LOCAL_STACK_PUSHES.load(Ordering::Relaxed),
+            global_queue_spills: GLOBAL_QUEUE_SPILLS.load(Ordering::Relaxed),
+            cancel_skipped_dirs: CANCEL_SKIPPED_DIRS.load(Ordering::Relaxed),
         }
     }
 }
@@ -889,6 +955,7 @@ pub fn scan(
     max_depth: usize,
     filter: FileFilter,
     options: ScanOptions,
+    cancel_flag: Option<Arc<AtomicBool>>,
     collect_syscall_stats: bool,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
@@ -907,6 +974,10 @@ pub fn scan(
     RDAHEAD_FAILS.store(0, Ordering::Relaxed);
     RDAHEAD_NANOS.store(0, Ordering::Relaxed);
     CLOSE_CALLS.store(0, Ordering::Relaxed);
+    FD_BUDGET_MISSES.store(0, Ordering::Relaxed);
+    LOCAL_STACK_PUSHES.store(0, Ordering::Relaxed);
+    GLOBAL_QUEUE_SPILLS.store(0, Ordering::Relaxed);
+    CANCEL_SKIPPED_DIRS.store(0, Ordering::Relaxed);
 
     let mut root_path = root_path.to_string();
     while root_path.ends_with('/') && root_path.len() > 1 {
@@ -965,6 +1036,7 @@ pub fn scan(
         let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
         let opts = scan_options.clone();
+        let cancel = cancel_flag.clone();
         handles.push(std::thread::spawn(move || unsafe {
             worker(
                 rx,
@@ -977,6 +1049,7 @@ pub fn scan(
                 max_depth,
                 flt,
                 opts,
+                cancel,
                 collect_syscall_stats,
             )
         }));
