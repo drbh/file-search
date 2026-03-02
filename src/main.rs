@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "file-search")]
+#[command(name = "f")]
 #[command(about = "Fast file search using macOS getattrlistbulk", long_about = None)]
 struct Cli {
     /// Directory to search (defaults to current directory)
