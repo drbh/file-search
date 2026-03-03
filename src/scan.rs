@@ -1,4 +1,5 @@
 use crossbeam_channel::unbounded;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
 use libc::{dirent, DIR};
 use std::ffi::CStr;
 use std::os::fd::RawFd;
@@ -340,11 +341,6 @@ struct WorkItem {
     depth: usize,
 }
 
-enum WorkMsg {
-    Dir(WorkItem),
-    Shutdown,
-}
-
 struct PathScratch {
     buf: String,
     base_len: usize,
@@ -416,16 +412,8 @@ impl FdBudget {
 }
 
 #[inline]
-fn mark_work_complete(
-    active_count: &AtomicUsize,
-    work_tx: &crossbeam_channel::Sender<WorkMsg>,
-    workers: usize,
-) {
-    if active_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-        for _ in 0..workers {
-            let _ = work_tx.send(WorkMsg::Shutdown);
-        }
-    }
+fn mark_work_complete(active_count: &AtomicUsize) {
+    active_count.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// File filter configuration
@@ -580,13 +568,13 @@ unsafe fn schedule_child_directory(
     depth: usize,
     max_depth: usize,
     path_buf: &mut PathScratch,
-    local_stack: &mut Vec<WorkItem>,
+    local_deque: &DequeWorker<WorkItem>,
+    global_injector: &Injector<WorkItem>,
+    dispatch_counter: &mut usize,
     local_stack_limit: usize,
     fd_budget: &FdBudget,
     name_cbuf: &mut Vec<u8>,
-    work_tx: &crossbeam_channel::Sender<WorkMsg>,
     active_count: &AtomicUsize,
-    workers: usize,
     collect_syscall_stats: bool,
     sys_stats: &mut LocalSysStats,
 ) {
@@ -595,66 +583,58 @@ unsafe fn schedule_child_directory(
         return;
     }
 
-    let composed = path_buf.compose(name).to_owned();
-    if local_stack.len() < local_stack_limit {
-        let mut next_fd: Option<RawFd> = None;
-        if fd_budget.try_acquire() {
-            name_cbuf.clear();
-            name_cbuf.extend_from_slice(name.as_bytes());
-            name_cbuf.push(0);
-            let cfd = timed_openat(
-                parent_fd,
-                name_cbuf.as_ptr() as *const i8,
-                O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                false,
-                collect_syscall_stats,
-                sys_stats,
-            );
-            if cfd >= 0 {
-                next_fd = Some(cfd);
-            } else {
-                fd_budget.release();
-            }
-        } else if collect_syscall_stats {
-            sys_stats.fd_budget_misses += 1;
+    let mut next_fd: Option<RawFd> = None;
+    if fd_budget.try_acquire() {
+        name_cbuf.clear();
+        name_cbuf.extend_from_slice(name.as_bytes());
+        name_cbuf.push(0);
+        let cfd = timed_openat(
+            parent_fd,
+            name_cbuf.as_ptr() as *const i8,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            false,
+            collect_syscall_stats,
+            sys_stats,
+        );
+        if cfd >= 0 {
+            next_fd = Some(cfd);
+        } else {
+            fd_budget.release();
         }
-        // Increment counter BEFORE queueing to prevent race with completion.
-        active_count.fetch_add(1, Ordering::Relaxed);
-        let child = WorkItem {
-            path: composed,
-            dirfd: next_fd,
-            depth: next_depth,
-        };
+    } else if collect_syscall_stats {
+        sys_stats.fd_budget_misses += 1;
+    }
+
+    // Increment counter BEFORE queueing to prevent race with completion.
+    active_count.fetch_add(1, Ordering::Relaxed);
+    let child = WorkItem {
+        path: path_buf.compose(name).to_owned(),
+        dirfd: next_fd,
+        depth: next_depth,
+    };
+
+    *dispatch_counter = dispatch_counter.wrapping_add(1);
+    if *dispatch_counter % local_stack_limit == 0 {
+        global_injector.push(child);
+        if collect_syscall_stats {
+            sys_stats.global_queue_spills += 1;
+        }
+    } else {
+        local_deque.push(child);
         if collect_syscall_stats {
             sys_stats.local_stack_pushes += 1;
-        }
-        local_stack.push(child);
-    } else {
-        // Global queue items are path-only: avoid holding child FDs in queue.
-        active_count.fetch_add(1, Ordering::Relaxed);
-        let child = WorkItem {
-            path: composed,
-            dirfd: None,
-            depth: next_depth,
-        };
-        if let Err(_err) = work_tx.send(WorkMsg::Dir(child)) {
-            if collect_syscall_stats {
-                sys_stats.global_queue_spills += 1;
-            }
-            mark_work_complete(active_count, work_tx, workers);
-        } else if collect_syscall_stats {
-            sys_stats.global_queue_spills += 1;
         }
     }
 }
 
 unsafe fn worker(
-    work_rx: crossbeam_channel::Receiver<WorkMsg>,
-    work_tx: crossbeam_channel::Sender<WorkMsg>,
+    worker_index: usize,
+    local_deque: DequeWorker<WorkItem>,
+    stealers: Arc<[Stealer<WorkItem>]>,
+    global_injector: Arc<Injector<WorkItem>>,
     result_tx: crossbeam_channel::Sender<ResultBatch>,
     active_count: Arc<AtomicUsize>,
     fd_budget: Arc<FdBudget>,
-    workers: usize,
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
@@ -685,18 +665,45 @@ unsafe fn worker(
     let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
-    let mut local_stack: Vec<WorkItem> = Vec::with_capacity(local_stack_limit);
+    let mut dispatch_counter: usize = worker_index;
     let has_cancel = cancel_flag.is_some();
 
     loop {
-        let work = if let Some(local) = local_stack.pop() {
-            local
-        } else {
-            match work_rx.recv() {
-                Ok(WorkMsg::Dir(w)) => w,
-                Ok(WorkMsg::Shutdown) => break,
-                Err(_) => break,
+        let work = loop {
+            if let Some(local) = local_deque.pop() {
+                break Some(local);
             }
+            match global_injector.steal_batch_and_pop(&local_deque) {
+                Steal::Success(item) => break Some(item),
+                Steal::Retry => continue,
+                Steal::Empty => {}
+            }
+
+            let mut stolen = None;
+            for (idx, stealer) in stealers.iter().enumerate() {
+                if idx == worker_index {
+                    continue;
+                }
+                match stealer.steal_batch_and_pop(&local_deque) {
+                    Steal::Success(item) => {
+                        stolen = Some(item);
+                        break;
+                    }
+                    Steal::Retry => continue,
+                    Steal::Empty => {}
+                }
+            }
+            if stolen.is_some() {
+                break stolen;
+            }
+
+            if active_count.load(Ordering::Acquire) == 0 {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        let Some(work) = work else {
+            break;
         };
 
         if has_cancel && is_cancelled(&cancel_flag) {
@@ -710,7 +717,7 @@ unsafe fn worker(
             if collect_syscall_stats {
                 sys_stats.cancel_skipped_dirs += 1;
             }
-            mark_work_complete(&active_count, &work_tx, workers);
+            mark_work_complete(&active_count);
             continue;
         }
 
@@ -740,7 +747,7 @@ unsafe fn worker(
                     &mut sys_stats,
                 );
                 if fd < 0 {
-                    mark_work_complete(&active_count, &work_tx, workers);
+                    mark_work_complete(&active_count);
                     continue;
                 }
                 fd
@@ -789,13 +796,13 @@ unsafe fn worker(
                             depth,
                             max_depth,
                             &mut path_buf,
-                            &mut local_stack,
+                            &local_deque,
+                            &global_injector,
+                            &mut dispatch_counter,
                             local_stack_limit,
                             &fd_budget,
                             &mut name_cbuf,
-                            &work_tx,
                             &active_count,
-                            workers,
                             collect_syscall_stats,
                             &mut sys_stats,
                         );
@@ -846,13 +853,13 @@ unsafe fn worker(
                                     depth,
                                     max_depth,
                                     &mut path_buf,
-                                    &mut local_stack,
+                                    &local_deque,
+                                    &global_injector,
+                                    &mut dispatch_counter,
                                     local_stack_limit,
                                     &fd_budget,
                                     &mut name_cbuf,
-                                    &work_tx,
                                     &active_count,
-                                    workers,
                                     collect_syscall_stats,
                                     &mut sys_stats,
                                 );
@@ -966,13 +973,13 @@ unsafe fn worker(
                             depth,
                             max_depth,
                             &mut path_buf,
-                            &mut local_stack,
+                            &local_deque,
+                            &global_injector,
+                            &mut dispatch_counter,
                             local_stack_limit,
                             &fd_budget,
                             &mut name_cbuf,
-                            &work_tx,
                             &active_count,
-                            workers,
                             collect_syscall_stats,
                             &mut sys_stats,
                         );
@@ -1022,7 +1029,7 @@ unsafe fn worker(
 
         // Decrement counter for this directory finishing
         // (subdirs were already incremented when queued)
-        mark_work_complete(&active_count, &work_tx, workers);
+        mark_work_complete(&active_count);
     }
 
     if list_mode {
@@ -1297,17 +1304,51 @@ pub fn scan(
     let workers = resolve_scan_workers(fd_limit, dir_backend);
     let local_stack_limit = resolve_local_stack_limit();
 
-    let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
+    let global_injector = Arc::new(Injector::<WorkItem>::new());
+    let mut local_deques = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        local_deques.push(DequeWorker::new_lifo());
+    }
+    let stealers = Arc::<[Stealer<WorkItem>]>::from(
+        local_deques
+            .iter()
+            .map(|deque| deque.stealer())
+            .collect::<Vec<_>>(),
+    );
+
+    // Kick off with root (depth 1)
+    let root_item = if fd_budget.try_acquire() {
+        WorkItem {
+            path: root_path,
+            dirfd: Some(root_fd),
+            depth: 1,
+        }
+    } else {
+        let _ = unsafe { close(root_fd) };
+        if collect_syscall_stats {
+            root_stats.close_calls += 1;
+        }
+        WorkItem {
+            path: root_path,
+            dirfd: None,
+            depth: 1,
+        }
+    };
+    if collect_syscall_stats {
+        flush_local_sys_stats(&root_stats);
+    }
+    global_injector.push(root_item);
+
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
     let active = Arc::new(AtomicUsize::new(1)); // root is in-flight
     let scan_options = Arc::new(options);
 
     let mut handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let rx = work_rx.clone();
-        let tx = work_tx.clone();
+    for (worker_index, local_deque) in local_deques.into_iter().enumerate() {
         let rtx = result_tx.clone();
         let ac = active.clone();
+        let deques = stealers.clone();
+        let injector = global_injector.clone();
         let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
         let backend = dir_backend;
@@ -1316,12 +1357,13 @@ pub fn scan(
         let cancel = cancel_flag.clone();
         handles.push(std::thread::spawn(move || unsafe {
             worker(
-                rx,
-                tx,
+                worker_index,
+                local_deque,
+                deques,
+                injector,
                 rtx,
                 ac,
                 fd_mgr,
-                workers,
                 list_mode,
                 max_depth,
                 flt,
@@ -1341,30 +1383,6 @@ pub fn scan(
         }
         drop(result_tx); // Close the channel when all workers are done
     });
-
-    // Kick off with root (depth 1)
-    let root_item = if fd_budget.try_acquire() {
-        WorkMsg::Dir(WorkItem {
-            path: root_path,
-            dirfd: Some(root_fd),
-            depth: 1,
-        })
-    } else {
-        let _ = unsafe { close(root_fd) };
-        if collect_syscall_stats {
-            root_stats.close_calls += 1;
-        }
-        WorkMsg::Dir(WorkItem {
-            path: root_path,
-            dirfd: None,
-            depth: 1,
-        })
-    };
-    if collect_syscall_stats {
-        flush_local_sys_stats(&root_stats);
-    }
-    work_tx.send(root_item).unwrap();
-    drop(work_tx); // allow workers to terminate when queue drains
 
     ScanHandle {
         receiver: result_rx,
