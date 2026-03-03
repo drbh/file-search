@@ -1,7 +1,6 @@
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
-use libc::{dirent, DIR};
-use std::ffi::CStr;
+use libc::dirent;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -37,11 +36,13 @@ extern "C" {
     fn close(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getdtablesize() -> i32;
-    fn fdopendir(fd: i32) -> *mut DIR;
-    fn readdir(dirp: *mut DIR) -> *mut dirent;
-    fn closedir(dirp: *mut DIR) -> i32;
-    #[link_name = "dirfd"]
-    fn c_dirfd(dirp: *mut DIR) -> i32;
+    #[link_name = "__getdirentries64"]
+    fn c_getdirentries64(
+        fd: i32,
+        buf: *mut core::ffi::c_void,
+        nbytes: usize,
+        basep: *mut libc::off_t,
+    ) -> isize;
     fn getrlimit(resource: i32, rlp: *mut rlimit) -> i32;
     fn setrlimit(resource: i32, rlp: *const rlimit) -> i32;
 }
@@ -76,6 +77,7 @@ const FD_MAX_LIMIT: usize = 262144;
 const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
 const PATH_RESULT_BATCH_SIZE: usize = 4096;
 const LOCAL_WORK_STACK_LIMIT_DEFAULT: usize = 32;
+const DIRENT_BUF_SIZE: usize = 256 << 10;
 const RLIMIT_NOFILE: i32 = 8;
 const RLIM_INFINITY: u64 = !0;
 
@@ -646,6 +648,7 @@ unsafe fn worker(
 ) {
     // Thread-local reusable buffers
     let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
+    let mut dirent_buf = vec![0u8; DIRENT_BUF_SIZE];
     let mut sys_stats = LocalSysStats::default();
     let enable_rdahead = std::env::var_os("FILE_SEARCH_ENABLE_RDAHEAD").is_some()
         && std::env::var_os("FILE_SEARCH_DISABLE_RDAHEAD").is_none();
@@ -754,33 +757,47 @@ unsafe fn worker(
             }
         };
         path_buf.set_base(&path);
-        let mut dirfd_closed = false;
         let mut scanned_with_dirent = false;
 
         if dir_backend == DirBackend::Dirent {
-            let dirp = fdopendir(dirfd);
-            if !dirp.is_null() {
-                scanned_with_dirent = true;
-                let scan_fd = c_dirfd(dirp);
-                if enable_rdahead {
-                    timed_set_rdahead(scan_fd, collect_syscall_stats, &mut sys_stats);
+            scanned_with_dirent = true;
+            if enable_rdahead {
+                timed_set_rdahead(dirfd, collect_syscall_stats, &mut sys_stats);
+            }
+            let mut basep: libc::off_t = 0;
+            loop {
+                if has_cancel && is_cancelled(&cancel_flag) {
+                    break;
                 }
-                loop {
-                    if has_cancel && is_cancelled(&cancel_flag) {
+
+                let nread = c_getdirentries64(
+                    dirfd,
+                    dirent_buf.as_mut_ptr().cast(),
+                    dirent_buf.len(),
+                    &mut basep,
+                );
+                if nread <= 0 {
+                    break;
+                }
+
+                let nread = nread as usize;
+                let mut p = 0usize;
+                while p < nread {
+                    let ent = &*(dirent_buf.as_ptr().add(p) as *const dirent);
+                    let reclen = ent.d_reclen as usize;
+                    if reclen == 0 || p + reclen > nread {
                         break;
                     }
 
-                    let ent_ptr = readdir(dirp);
-                    if ent_ptr.is_null() {
-                        break;
-                    }
-                    let ent = &*ent_ptr;
-                    let name_cstr = CStr::from_ptr(ent.d_name.as_ptr());
-                    let name_bytes = name_cstr.to_bytes();
-                    if name_bytes.is_empty() {
+                    let name_len = ent.d_namlen as usize;
+                    if name_len == 0 {
+                        p += reclen;
                         continue;
                     }
+                    let name_bytes =
+                        std::slice::from_raw_parts(ent.d_name.as_ptr() as *const u8, name_len);
                     if name_bytes == b"." || name_bytes == b".." {
+                        p += reclen;
                         continue;
                     }
 
@@ -788,10 +805,11 @@ unsafe fn worker(
                         // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
                         let name = std::str::from_utf8_unchecked(name_bytes);
                         if scan_options.should_skip_dir(&path, name) {
+                            p += reclen;
                             continue;
                         }
                         schedule_child_directory(
-                            scan_fd,
+                            dirfd,
                             name,
                             depth,
                             max_depth,
@@ -832,7 +850,7 @@ unsafe fn worker(
                         name_cbuf.extend_from_slice(name_bytes);
                         name_cbuf.push(0);
                         let maybe_dir_fd = timed_openat(
-                            scan_fd,
+                            dirfd,
                             name_cbuf.as_ptr() as *const i8,
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                             false,
@@ -848,7 +866,7 @@ unsafe fn worker(
                             let name = std::str::from_utf8_unchecked(name_bytes);
                             if !scan_options.should_skip_dir(&path, name) {
                                 schedule_child_directory(
-                                    scan_fd,
+                                    dirfd,
                                     name,
                                     depth,
                                     max_depth,
@@ -884,12 +902,9 @@ unsafe fn worker(
                             }
                         }
                     }
+
+                    p += reclen;
                 }
-                let _ = closedir(dirp);
-                if collect_syscall_stats {
-                    sys_stats.close_calls += 1;
-                }
-                dirfd_closed = true;
             }
         }
 
@@ -1017,11 +1032,9 @@ unsafe fn worker(
             }
         }
 
-        if !dirfd_closed {
-            let _ = close(dirfd);
-            if collect_syscall_stats {
-                sys_stats.close_calls += 1;
-            }
+        let _ = close(dirfd);
+        if collect_syscall_stats {
+            sys_stats.close_calls += 1;
         }
         if held_fd {
             fd_budget.release();
