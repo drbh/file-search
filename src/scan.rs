@@ -1,4 +1,6 @@
 use crossbeam_channel::unbounded;
+use libc::{dirent, DIR};
+use std::ffi::CStr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,6 +36,13 @@ extern "C" {
     fn close(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getdtablesize() -> i32;
+    fn fdopendir(fd: i32) -> *mut DIR;
+    fn readdir(dirp: *mut DIR) -> *mut dirent;
+    fn closedir(dirp: *mut DIR) -> i32;
+    #[link_name = "dirfd"]
+    fn c_dirfd(dirp: *mut DIR) -> i32;
+    fn getrlimit(resource: i32, rlp: *mut rlimit) -> i32;
+    fn setrlimit(resource: i32, rlp: *const rlimit) -> i32;
 }
 
 #[inline]
@@ -62,14 +71,31 @@ const BULK_EXPAND_SLACK: usize = 128 << 10; // grow when buffer nearly full
 const DEFAULT_FD_LIMIT: usize = 1024;
 const FD_HEADROOM: usize = 64;
 const FD_MIN_LIMIT: usize = 64;
-const FD_MAX_LIMIT: usize = 65536;
+const FD_MAX_LIMIT: usize = 262144;
 const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
 const PATH_RESULT_BATCH_SIZE: usize = 4096;
-const LOCAL_WORK_STACK_LIMIT: usize = 8;
+const LOCAL_WORK_STACK_LIMIT: usize = 64;
+const RLIMIT_NOFILE: i32 = 8;
+const RLIM_INFINITY: u64 = !0;
+
+#[repr(C)]
+struct rlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
 
 // Darwin vtype constants
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
+const DT_UNKNOWN: u8 = 0;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirBackend {
+    GetAttrListBulk,
+    Dirent,
+}
 
 static GETATTR_CALLS: AtomicU64 = AtomicU64::new(0);
 static GETATTR_ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -547,6 +573,80 @@ impl FileFilter {
     }
 }
 
+#[inline]
+unsafe fn schedule_child_directory(
+    parent_fd: i32,
+    name: &str,
+    depth: usize,
+    max_depth: usize,
+    path_buf: &mut PathScratch,
+    local_stack: &mut Vec<WorkItem>,
+    fd_budget: &FdBudget,
+    name_cbuf: &mut Vec<u8>,
+    work_tx: &crossbeam_channel::Sender<WorkMsg>,
+    active_count: &AtomicUsize,
+    workers: usize,
+    collect_syscall_stats: bool,
+    sys_stats: &mut LocalSysStats,
+) {
+    let next_depth = depth + 1;
+    if max_depth > 0 && next_depth > max_depth {
+        return;
+    }
+
+    let composed = path_buf.compose(name).to_owned();
+    if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
+        let mut next_fd: Option<RawFd> = None;
+        if fd_budget.try_acquire() {
+            name_cbuf.clear();
+            name_cbuf.extend_from_slice(name.as_bytes());
+            name_cbuf.push(0);
+            let cfd = timed_openat(
+                parent_fd,
+                name_cbuf.as_ptr() as *const i8,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                false,
+                collect_syscall_stats,
+                sys_stats,
+            );
+            if cfd >= 0 {
+                next_fd = Some(cfd);
+            } else {
+                fd_budget.release();
+            }
+        } else if collect_syscall_stats {
+            sys_stats.fd_budget_misses += 1;
+        }
+        // Increment counter BEFORE queueing to prevent race with completion.
+        active_count.fetch_add(1, Ordering::Relaxed);
+        let child = WorkItem {
+            path: composed,
+            dirfd: next_fd,
+            depth: next_depth,
+        };
+        if collect_syscall_stats {
+            sys_stats.local_stack_pushes += 1;
+        }
+        local_stack.push(child);
+    } else {
+        // Global queue items are path-only: avoid holding child FDs in queue.
+        active_count.fetch_add(1, Ordering::Relaxed);
+        let child = WorkItem {
+            path: composed,
+            dirfd: None,
+            depth: next_depth,
+        };
+        if let Err(_err) = work_tx.send(WorkMsg::Dir(child)) {
+            if collect_syscall_stats {
+                sys_stats.global_queue_spills += 1;
+            }
+            mark_work_complete(active_count, work_tx, workers);
+        } else if collect_syscall_stats {
+            sys_stats.global_queue_spills += 1;
+        }
+    }
+}
+
 unsafe fn worker(
     work_rx: crossbeam_channel::Receiver<WorkMsg>,
     work_tx: crossbeam_channel::Sender<WorkMsg>,
@@ -557,6 +657,7 @@ unsafe fn worker(
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
+    dir_backend: DirBackend,
     scan_options: Arc<ScanOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
     collect_syscall_stats: bool,
@@ -643,175 +744,271 @@ unsafe fn worker(
             }
         };
         path_buf.set_base(&path);
+        let mut dirfd_closed = false;
+        let mut scanned_with_dirent = false;
 
-        // Enable directory read-ahead for better performance
-        if enable_rdahead {
-            timed_set_rdahead(dirfd, collect_syscall_stats, &mut sys_stats);
-        }
-
-        loop {
-            if has_cancel && is_cancelled(&cancel_flag) {
-                break;
-            }
-            let n = timed_getattrlistbulk(
-                dirfd,
-                &al,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                collect_syscall_stats,
-                &mut sys_stats,
-            );
-            if n < 0 {
-                // syscall error; stop scanning this directory
-                break;
-            }
-            if n == 0 {
-                // End of directory
-                break;
-            }
-
-            // n == number of records, not bytes
-            let mut p = 0usize;
-            let mut stop_dir_scan = false;
-            for _ in 0..(n as usize) {
-                if has_cancel && is_cancelled(&cancel_flag) {
-                    stop_dir_scan = true;
-                    break;
+        if dir_backend == DirBackend::Dirent {
+            let dirp = fdopendir(dirfd);
+            if !dirp.is_null() {
+                scanned_with_dirent = true;
+                let scan_fd = c_dirfd(dirp);
+                if enable_rdahead {
+                    timed_set_rdahead(scan_fd, collect_syscall_stats, &mut sys_stats);
                 }
-                let base = buf.as_ptr().add(p);
+                loop {
+                    if has_cancel && is_cancelled(&cancel_flag) {
+                        break;
+                    }
 
-                // [u32 reclen]
-                let reclen = read_u32_unaligned(base) as usize;
-
-                // skip returned_attrs (attribute_set_t = 5 * u32)
-                let name_ref_ptr = base.add(4 + 20);
-                let name_ref = read_attrref_unaligned(name_ref_ptr);
-
-                // objtype right after attrreference
-                let objtype = read_u32_unaligned(name_ref_ptr.add(mem::size_of::<attrreference>()));
-
-                // Name bytes are at (name_ref_ptr + name_ref.off) with byte length name_ref.len
-                // Calculate offset relative to buffer start
-                let name_start =
-                    (name_ref_ptr as usize - buf.as_ptr() as usize) + (name_ref.off as usize);
-                let name_len = name_ref.len as usize;
-
-                // Trim a trailing NUL if present; avoid CStr and extra validation work.
-                let name_bytes = &buf[name_start..name_start + name_len];
-                let name_bytes = if !name_bytes.is_empty() && *name_bytes.last().unwrap() == 0 {
-                    &name_bytes[..name_len - 1]
-                } else {
-                    name_bytes
-                };
-
-                if name_bytes == b"." || name_bytes == b".." {
-                    p += reclen;
-                    continue;
-                }
-
-                if objtype == VDIR {
-                    // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
-                    let name = std::str::from_utf8_unchecked(name_bytes);
-                    if scan_options.should_skip_dir(&path, name) {
-                        p += reclen;
+                    let ent_ptr = readdir(dirp);
+                    if ent_ptr.is_null() {
+                        break;
+                    }
+                    let ent = &*ent_ptr;
+                    let name_cstr = CStr::from_ptr(ent.d_name.as_ptr());
+                    let name_bytes = name_cstr.to_bytes();
+                    if name_bytes.is_empty() {
                         continue;
                     }
-                    // Check max_depth: 0 means unlimited, otherwise respect the limit
-                    let next_depth = depth + 1;
-                    if max_depth > 0 && next_depth > max_depth {
-                        p += reclen;
+                    if name_bytes == b"." || name_bytes == b".." {
                         continue;
                     }
-                    let mut next_fd: Option<RawFd> = None;
 
-                    if fd_budget.try_acquire() {
+                    if ent.d_type == DT_DIR {
+                        // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                        let name = std::str::from_utf8_unchecked(name_bytes);
+                        if scan_options.should_skip_dir(&path, name) {
+                            continue;
+                        }
+                        schedule_child_directory(
+                            scan_fd,
+                            name,
+                            depth,
+                            max_depth,
+                            &mut path_buf,
+                            &mut local_stack,
+                            &fd_budget,
+                            &mut name_cbuf,
+                            &work_tx,
+                            &active_count,
+                            workers,
+                            collect_syscall_stats,
+                            &mut sys_stats,
+                        );
+                    } else if ent.d_type == DT_REG {
+                        if filter.matches_bytes(name_bytes) {
+                            if list_mode {
+                                // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                                let name = std::str::from_utf8_unchecked(name_bytes);
+                                let composed = path_buf.compose(name).to_owned();
+                                pending_paths.push(composed);
+                                if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
+                                    let batch = std::mem::take(&mut pending_paths);
+                                    let _ = result_tx.send(ResultBatch::Paths(batch));
+                                    pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+                                }
+                            } else {
+                                pending_count += 1;
+                                if pending_count >= COUNT_RESULT_BATCH_SIZE {
+                                    let _ = result_tx.send(ResultBatch::Count(pending_count));
+                                    pending_count = 0;
+                                }
+                            }
+                        }
+                    } else if ent.d_type == DT_UNKNOWN {
+                        // Unknown type: probe directory cheaply with openat(O_DIRECTORY).
                         name_cbuf.clear();
-                        name_cbuf.extend_from_slice(name.as_bytes());
+                        name_cbuf.extend_from_slice(name_bytes);
                         name_cbuf.push(0);
-                        let cfd = timed_openat(
-                            dirfd,
+                        let maybe_dir_fd = timed_openat(
+                            scan_fd,
                             name_cbuf.as_ptr() as *const i8,
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
                             false,
                             collect_syscall_stats,
                             &mut sys_stats,
                         );
-                        if cfd >= 0 {
-                            next_fd = Some(cfd);
-                        } else {
-                            fd_budget.release();
-                        }
-                    } else if collect_syscall_stats {
-                        sys_stats.fd_budget_misses += 1;
-                    }
-                    // If we can't acquire fd budget, next_fd stays None and we'll open by path later
-
-                    // Increment counter BEFORE sending to queue to prevent race
-                    active_count.fetch_add(1, Ordering::Relaxed);
-                    let composed = path_buf.compose(name).to_owned();
-                    let child = WorkItem {
-                        path: composed,
-                        dirfd: next_fd,
-                        depth: next_depth,
-                    };
-                    if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
-                        if collect_syscall_stats {
-                            sys_stats.local_stack_pushes += 1;
-                        }
-                        local_stack.push(child);
-                    } else if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
-                        if collect_syscall_stats {
-                            sys_stats.global_queue_spills += 1;
-                        }
-                        if let WorkMsg::Dir(failed_child) = err.0 {
-                            if let Some(fd) = failed_child.dirfd {
-                                let _ = close(fd);
-                                if collect_syscall_stats {
-                                    sys_stats.close_calls += 1;
-                                }
-                                fd_budget.release();
+                        if maybe_dir_fd >= 0 {
+                            let _ = close(maybe_dir_fd);
+                            if collect_syscall_stats {
+                                sys_stats.close_calls += 1;
                             }
-                        }
-                        mark_work_complete(&active_count, &work_tx, workers);
-                    } else if collect_syscall_stats {
-                        sys_stats.global_queue_spills += 1;
-                    }
-                } else if objtype == VREG && filter.matches_bytes(name_bytes) {
-                    if list_mode {
-                        // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
-                        let name = std::str::from_utf8_unchecked(name_bytes);
-                        let composed = path_buf.compose(name).to_owned();
-                        pending_paths.push(composed);
-                        if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
-                            let batch = std::mem::take(&mut pending_paths);
-                            let _ = result_tx.send(ResultBatch::Paths(batch));
-                            pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
-                        }
-                    } else {
-                        pending_count += 1;
-                        if pending_count >= COUNT_RESULT_BATCH_SIZE {
-                            let _ = result_tx.send(ResultBatch::Count(pending_count));
-                            pending_count = 0;
+                            // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                            let name = std::str::from_utf8_unchecked(name_bytes);
+                            if !scan_options.should_skip_dir(&path, name) {
+                                schedule_child_directory(
+                                    scan_fd,
+                                    name,
+                                    depth,
+                                    max_depth,
+                                    &mut path_buf,
+                                    &mut local_stack,
+                                    &fd_budget,
+                                    &mut name_cbuf,
+                                    &work_tx,
+                                    &active_count,
+                                    workers,
+                                    collect_syscall_stats,
+                                    &mut sys_stats,
+                                );
+                            }
+                        } else if filter.matches_bytes(name_bytes) {
+                            if list_mode {
+                                // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                                let name = std::str::from_utf8_unchecked(name_bytes);
+                                let composed = path_buf.compose(name).to_owned();
+                                pending_paths.push(composed);
+                                if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
+                                    let batch = std::mem::take(&mut pending_paths);
+                                    let _ = result_tx.send(ResultBatch::Paths(batch));
+                                    pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+                                }
+                            } else {
+                                pending_count += 1;
+                                if pending_count >= COUNT_RESULT_BATCH_SIZE {
+                                    let _ = result_tx.send(ResultBatch::Count(pending_count));
+                                    pending_count = 0;
+                                }
+                            }
                         }
                     }
                 }
-
-                p += reclen; // advance to next record
-            }
-
-            if stop_dir_scan {
-                break;
-            }
-
-            if p + BULK_EXPAND_SLACK >= buf.len() && buf.len() < MAX_BULK_BUF_SIZE {
-                let new_len = (buf.len() * 2).min(MAX_BULK_BUF_SIZE);
-                buf.resize(new_len, 0);
+                let _ = closedir(dirp);
+                if collect_syscall_stats {
+                    sys_stats.close_calls += 1;
+                }
+                dirfd_closed = true;
             }
         }
 
-        let _ = close(dirfd);
-        if collect_syscall_stats {
-            sys_stats.close_calls += 1;
+        if !scanned_with_dirent {
+            // Enable directory read-ahead for better performance
+            if enable_rdahead {
+                timed_set_rdahead(dirfd, collect_syscall_stats, &mut sys_stats);
+            }
+
+            loop {
+                if has_cancel && is_cancelled(&cancel_flag) {
+                    break;
+                }
+                let n = timed_getattrlistbulk(
+                    dirfd,
+                    &al,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    collect_syscall_stats,
+                    &mut sys_stats,
+                );
+                if n < 0 {
+                    // syscall error; stop scanning this directory
+                    break;
+                }
+                if n == 0 {
+                    // End of directory
+                    break;
+                }
+
+                // n == number of records, not bytes
+                let mut p = 0usize;
+                let mut stop_dir_scan = false;
+                for _ in 0..(n as usize) {
+                    if has_cancel && is_cancelled(&cancel_flag) {
+                        stop_dir_scan = true;
+                        break;
+                    }
+                    let base = buf.as_ptr().add(p);
+
+                    // [u32 reclen]
+                    let reclen = read_u32_unaligned(base) as usize;
+
+                    // skip returned_attrs (attribute_set_t = 5 * u32)
+                    let name_ref_ptr = base.add(4 + 20);
+                    let name_ref = read_attrref_unaligned(name_ref_ptr);
+
+                    // objtype right after attrreference
+                    let objtype =
+                        read_u32_unaligned(name_ref_ptr.add(mem::size_of::<attrreference>()));
+
+                    // Name bytes are at (name_ref_ptr + name_ref.off) with byte length name_ref.len
+                    // Calculate offset relative to buffer start
+                    let name_start =
+                        (name_ref_ptr as usize - buf.as_ptr() as usize) + (name_ref.off as usize);
+                    let name_len = name_ref.len as usize;
+
+                    // Trim a trailing NUL if present; avoid CStr and extra validation work.
+                    let name_bytes = &buf[name_start..name_start + name_len];
+                    let name_bytes = if !name_bytes.is_empty() && *name_bytes.last().unwrap() == 0 {
+                        &name_bytes[..name_len - 1]
+                    } else {
+                        name_bytes
+                    };
+
+                    if name_bytes == b"." || name_bytes == b".." {
+                        p += reclen;
+                        continue;
+                    }
+
+                    if objtype == VDIR {
+                        // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                        let name = std::str::from_utf8_unchecked(name_bytes);
+                        if scan_options.should_skip_dir(&path, name) {
+                            p += reclen;
+                            continue;
+                        }
+                        schedule_child_directory(
+                            dirfd,
+                            name,
+                            depth,
+                            max_depth,
+                            &mut path_buf,
+                            &mut local_stack,
+                            &fd_budget,
+                            &mut name_cbuf,
+                            &work_tx,
+                            &active_count,
+                            workers,
+                            collect_syscall_stats,
+                            &mut sys_stats,
+                        );
+                    } else if objtype == VREG && filter.matches_bytes(name_bytes) {
+                        if list_mode {
+                            // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                            let name = std::str::from_utf8_unchecked(name_bytes);
+                            let composed = path_buf.compose(name).to_owned();
+                            pending_paths.push(composed);
+                            if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
+                                let batch = std::mem::take(&mut pending_paths);
+                                let _ = result_tx.send(ResultBatch::Paths(batch));
+                                pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+                            }
+                        } else {
+                            pending_count += 1;
+                            if pending_count >= COUNT_RESULT_BATCH_SIZE {
+                                let _ = result_tx.send(ResultBatch::Count(pending_count));
+                                pending_count = 0;
+                            }
+                        }
+                    }
+
+                    p += reclen; // advance to next record
+                }
+
+                if stop_dir_scan {
+                    break;
+                }
+
+                if p + BULK_EXPAND_SLACK >= buf.len() && buf.len() < MAX_BULK_BUF_SIZE {
+                    let new_len = (buf.len() * 2).min(MAX_BULK_BUF_SIZE);
+                    buf.resize(new_len, 0);
+                }
+            }
+        }
+
+        if !dirfd_closed {
+            let _ = close(dirfd);
+            if collect_syscall_stats {
+                sys_stats.close_calls += 1;
+            }
         }
         if held_fd {
             fd_budget.release();
@@ -836,8 +1033,43 @@ unsafe fn worker(
     }
 }
 
+fn raise_nofile_soft_limit() {
+    unsafe {
+        let mut lim = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if getrlimit(RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let mut desired = lim.rlim_max;
+        if desired == RLIM_INFINITY {
+            desired = FD_MAX_LIMIT as u64;
+        }
+        desired = desired.min(FD_MAX_LIMIT as u64);
+        if desired <= lim.rlim_cur {
+            return;
+        }
+        let bumped = rlimit {
+            rlim_cur: desired,
+            rlim_max: lim.rlim_max,
+        };
+        let _ = setrlimit(RLIMIT_NOFILE, &bumped);
+    }
+}
+
 fn detect_fd_limit() -> usize {
-    let raw = unsafe { getdtablesize() };
+    let mut lim = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let raw = unsafe {
+        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 {
+            lim.rlim_cur as i32
+        } else {
+            getdtablesize()
+        }
+    };
     let base = if raw > 0 {
         raw as usize
     } else {
@@ -847,7 +1079,19 @@ fn detect_fd_limit() -> usize {
         .clamp(FD_MIN_LIMIT, FD_MAX_LIMIT)
 }
 
-fn resolve_scan_workers() -> usize {
+fn resolve_dir_backend() -> DirBackend {
+    if let Ok(raw) = std::env::var("FILE_SEARCH_DIR_BACKEND") {
+        if raw.eq_ignore_ascii_case("bulk") {
+            return DirBackend::GetAttrListBulk;
+        }
+        if raw.eq_ignore_ascii_case("dirent") {
+            return DirBackend::Dirent;
+        }
+    }
+    DirBackend::Dirent
+}
+
+fn resolve_scan_workers(fd_limit: usize) -> usize {
     if let Ok(raw) = std::env::var("FILE_SEARCH_SCAN_WORKERS") {
         if let Ok(parsed) = raw.parse::<usize>() {
             return parsed.max(1);
@@ -858,10 +1102,19 @@ fn resolve_scan_workers() -> usize {
         .map(|n| n.get())
         .unwrap_or(4);
 
-    if cfg!(target_arch = "aarch64") {
-        cores.min(7).max(2)
+    let core_limited = if cfg!(target_arch = "aarch64") {
+        cores.min(6).max(2)
     } else {
         cores.min(8).max(2)
+    };
+
+    // If file descriptor headroom is tight, cap workers to reduce metadata contention.
+    if fd_limit < 2048 {
+        core_limited.min(2)
+    } else if fd_limit < 8192 {
+        core_limited.min(4)
+    } else {
+        core_limited
     }
 }
 
@@ -959,6 +1212,7 @@ pub fn scan(
     collect_syscall_stats: bool,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
+    raise_nofile_soft_limit();
 
     // Reset global counters
     GETATTR_CALLS.store(0, Ordering::Relaxed);
@@ -1020,7 +1274,8 @@ pub fn scan(
     };
 
     // Worker count: cap to 8; avoid extra contention on APFS metadata
-    let workers = resolve_scan_workers();
+    let workers = resolve_scan_workers(fd_limit);
+    let dir_backend = resolve_dir_backend();
 
     let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
@@ -1035,6 +1290,7 @@ pub fn scan(
         let ac = active.clone();
         let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
+        let backend = dir_backend;
         let opts = scan_options.clone();
         let cancel = cancel_flag.clone();
         handles.push(std::thread::spawn(move || unsafe {
@@ -1048,6 +1304,7 @@ pub fn scan(
                 list_mode,
                 max_depth,
                 flt,
+                backend,
                 opts,
                 cancel,
                 collect_syscall_stats,
