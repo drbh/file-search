@@ -326,7 +326,6 @@ fn run() -> io::Result<()> {
             cli.binary,
             mtime_filter,
             cli.workers,
-            cli.stats,
         )?;
 
         if !cli.list {
@@ -372,7 +371,6 @@ fn run() -> io::Result<()> {
         filter,
         scan_options,
         None,
-        cli.stats,
     );
 
     let mut total: usize = 0;
@@ -401,7 +399,7 @@ fn run() -> io::Result<()> {
                         let clamped =
                             clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
                         if seen.insert(clamped.clone()) {
-                            let _ = writeln!(writer, "{}", clamped);
+                            let _ = writeln!(writer, "{clamped}");
                         }
                     }
                 } else if cli.list {
@@ -412,7 +410,7 @@ fn run() -> io::Result<()> {
                             }
                         }
                         total += 1;
-                        let _ = writeln!(writer, "{}", p);
+                        let _ = writeln!(writer, "{p}");
                     }
                 } else {
                     for p in paths {
@@ -432,7 +430,7 @@ fn run() -> io::Result<()> {
     let stats = handle.wait_for_completion();
 
     if !cli.list {
-        println!("{}", total);
+        println!("{total}");
     }
 
     if cli.stats && !cli.quiet {
@@ -449,7 +447,6 @@ fn run() -> io::Result<()> {
         eprintln!("close calls:           {}", stats.close_calls);
         eprintln!("openat time:           {:.2} ms", stats.openat_ms);
         eprintln!("fstatat time:          {:.2} ms", stats.fstatat_ms);
-        eprintln!("fd budget misses:      {}", stats.fd_budget_misses);
         eprintln!("local stack pushes:    {}", stats.local_stack_pushes);
         eprintln!("global queue spills:   {}", stats.global_queue_spills);
         eprintln!("cancel-skipped dirs:   {}", stats.cancel_skipped_dirs);
@@ -459,7 +456,7 @@ fn run() -> io::Result<()> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("error: {}", err);
+        eprintln!("error: {err}");
         std::process::exit(1);
     }
 }

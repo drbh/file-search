@@ -56,7 +56,6 @@ static FSTATAT_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSTATAT_FAILS: AtomicU64 = AtomicU64::new(0);
 static FSTATAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
-static FD_BUDGET_MISSES: AtomicU64 = AtomicU64::new(0);
 static LOCAL_STACK_PUSHES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_QUEUE_SPILLS: AtomicU64 = AtomicU64::new(0);
 static CANCEL_SKIPPED_DIRS: AtomicU64 = AtomicU64::new(0);
@@ -72,7 +71,6 @@ struct LocalSysStats {
     openat_fails: u64,
     openat_nanos: u64,
     close_calls: u64,
-    fd_budget_misses: u64,
     local_stack_pushes: u64,
     global_queue_spills: u64,
     cancel_skipped_dirs: u64,
@@ -89,7 +87,6 @@ fn flush_local_sys_stats(stats: &LocalSysStats) {
     OPENAT_FAILS.fetch_add(stats.openat_fails, Ordering::Relaxed);
     OPENAT_NANOS.fetch_add(stats.openat_nanos, Ordering::Relaxed);
     CLOSE_CALLS.fetch_add(stats.close_calls, Ordering::Relaxed);
-    FD_BUDGET_MISSES.fetch_add(stats.fd_budget_misses, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.fetch_add(stats.local_stack_pushes, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.fetch_add(stats.global_queue_spills, Ordering::Relaxed);
     CANCEL_SKIPPED_DIRS.fetch_add(stats.cancel_skipped_dirs, Ordering::Relaxed);
@@ -108,26 +105,21 @@ unsafe fn timed_openat(
     path: *const i8,
     oflag: i32,
     absolute: bool,
-    collect_syscall_stats: bool,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    if collect_syscall_stats {
-        let start = Instant::now();
-        let fd = c_openat_nocancel(dfd, path, oflag);
-        stats.openat_calls += 1;
-        if absolute {
-            stats.openat_abs_calls += 1;
-        } else {
-            stats.openat_rel_calls += 1;
-        }
-        if fd < 0 {
-            stats.openat_fails += 1;
-        }
-        stats.openat_nanos += start.elapsed().as_nanos() as u64;
-        fd
+    let start = Instant::now();
+    let fd = c_openat_nocancel(dfd, path, oflag);
+    stats.openat_calls += 1;
+    if absolute {
+        stats.openat_abs_calls += 1;
     } else {
-        c_openat_nocancel(dfd, path, oflag)
+        stats.openat_rel_calls += 1;
     }
+    if fd < 0 {
+        stats.openat_fails += 1;
+    }
+    stats.openat_nanos += start.elapsed().as_nanos() as u64;
+    fd
 }
 
 #[inline]
@@ -136,21 +128,16 @@ unsafe fn timed_fstatat(
     path: *const i8,
     stat_buf: *mut libc::stat,
     flags: i32,
-    collect_syscall_stats: bool,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    if collect_syscall_stats {
-        let start = Instant::now();
-        let rc = libc::fstatat(dfd, path, stat_buf, flags);
-        stats.fstatat_calls += 1;
-        if rc < 0 {
-            stats.fstatat_fails += 1;
-        }
-        stats.fstatat_nanos += start.elapsed().as_nanos() as u64;
-        rc
-    } else {
-        libc::fstatat(dfd, path, stat_buf, flags)
+    let start = Instant::now();
+    let rc = libc::fstatat(dfd, path, stat_buf, flags);
+    stats.fstatat_calls += 1;
+    if rc < 0 {
+        stats.fstatat_fails += 1;
     }
+    stats.fstatat_nanos += start.elapsed().as_nanos() as u64;
+    rc
 }
 
 #[derive(Clone)]
@@ -257,7 +244,7 @@ impl ScanOptions {
 
 struct WorkItem {
     path: String,
-    dirfd: Option<RawFd>,
+    dirfd: RawFd,
     depth: usize,
 }
 
@@ -293,42 +280,6 @@ impl PathScratch {
 pub enum ResultBatch {
     Count(usize),
     Paths(Vec<String>),
-}
-
-struct FdBudget {
-    limit: usize,
-    in_use: AtomicUsize,
-}
-
-impl FdBudget {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            in_use: AtomicUsize::new(0),
-        }
-    }
-
-    fn try_acquire(&self) -> bool {
-        let mut current = self.in_use.load(Ordering::Relaxed);
-        loop {
-            if current >= self.limit {
-                return false;
-            }
-            match self.in_use.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn release(&self) {
-        self.in_use.fetch_sub(1, Ordering::Release);
-    }
 }
 
 #[inline]
@@ -518,10 +469,8 @@ unsafe fn schedule_child_directory(
     global_injector: &Injector<WorkItem>,
     dispatch_counter: &mut usize,
     local_stack_limit: usize,
-    fd_budget: &FdBudget,
     name_cbuf: &mut Vec<u8>,
     active_count: &AtomicUsize,
-    collect_syscall_stats: bool,
     sys_stats: &mut LocalSysStats,
 ) {
     let next_depth = depth + 1;
@@ -529,47 +478,35 @@ unsafe fn schedule_child_directory(
         return;
     }
 
-    let mut next_fd: Option<RawFd> = None;
-    if fd_budget.try_acquire() {
-        name_cbuf.clear();
-        name_cbuf.extend_from_slice(name.as_bytes());
-        name_cbuf.push(0);
-        let cfd = timed_openat(
-            parent_fd,
-            name_cbuf.as_ptr() as *const i8,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-            false,
-            collect_syscall_stats,
-            sys_stats,
-        );
-        if cfd >= 0 {
-            next_fd = Some(cfd);
-        } else {
-            fd_budget.release();
-        }
-    } else if collect_syscall_stats {
-        sys_stats.fd_budget_misses += 1;
+    name_cbuf.clear();
+    name_cbuf.extend_from_slice(name.as_bytes());
+    name_cbuf.push(0);
+    let child_fd = timed_openat(
+        parent_fd,
+        name_cbuf.as_ptr() as *const i8,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        false,
+        sys_stats,
+    );
+    if child_fd < 0 {
+        return;
     }
 
     // Increment counter BEFORE queueing to prevent race with completion.
     active_count.fetch_add(1, Ordering::Relaxed);
     let child = WorkItem {
         path: path_buf.compose(name).to_owned(),
-        dirfd: next_fd,
+        dirfd: child_fd,
         depth: next_depth,
     };
 
     *dispatch_counter = dispatch_counter.wrapping_add(1);
     if *dispatch_counter % local_stack_limit == 0 {
         global_injector.push(child);
-        if collect_syscall_stats {
-            sys_stats.global_queue_spills += 1;
-        }
+        sys_stats.global_queue_spills += 1;
     } else {
         local_deque.push(child);
-        if collect_syscall_stats {
-            sys_stats.local_stack_pushes += 1;
-        }
+        sys_stats.local_stack_pushes += 1;
     }
 }
 
@@ -580,20 +517,17 @@ unsafe fn worker(
     global_injector: Arc<Injector<WorkItem>>,
     result_tx: crossbeam_channel::Sender<ResultBatch>,
     active_count: Arc<AtomicUsize>,
-    fd_budget: Arc<FdBudget>,
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
     local_stack_limit: usize,
     scan_options: Arc<ScanOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
-    collect_syscall_stats: bool,
 ) {
     // Thread-local reusable buffers
     let mut dirent_buf = vec![0u8; DIRENT_BUF_SIZE];
     let mut sys_stats = LocalSysStats::default();
     let mut path_buf = PathScratch::new();
-    let mut dir_cbuf: Vec<u8> = Vec::with_capacity(1024); // for openat (NUL-terminated)
     let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
@@ -654,52 +588,14 @@ unsafe fn worker(
         };
 
         if has_cancel && is_cancelled(&cancel_flag) {
-            if let Some(fd) = work.dirfd {
-                let _ = close(fd);
-                if collect_syscall_stats {
-                    sys_stats.close_calls += 1;
-                }
-                fd_budget.release();
-            }
-            if collect_syscall_stats {
-                sys_stats.cancel_skipped_dirs += 1;
-            }
+            let _ = close(work.dirfd);
+            sys_stats.close_calls += 1;
+            sys_stats.cancel_skipped_dirs += 1;
             mark_work_complete(&active_count);
             continue;
         }
 
         let WorkItem { path, dirfd, depth } = work;
-
-        let mut held_fd = false;
-        let dirfd = match dirfd {
-            Some(fd) => {
-                held_fd = true;
-                fd
-            }
-            None => {
-                // Open by absolute path
-                dir_cbuf.clear();
-                if path.is_empty() {
-                    dir_cbuf.extend_from_slice(b"/");
-                } else {
-                    dir_cbuf.extend_from_slice(path.as_bytes());
-                }
-                dir_cbuf.push(0);
-                let fd = timed_openat(
-                    AT_FDCWD,
-                    dir_cbuf.as_ptr() as *const i8,
-                    O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                    true,
-                    collect_syscall_stats,
-                    &mut sys_stats,
-                );
-                if fd < 0 {
-                    mark_work_complete(&active_count);
-                    continue;
-                }
-                fd
-            }
-        };
         path_buf.set_base(&path);
         let mut basep: libc::off_t = 0;
         loop {
@@ -755,10 +651,8 @@ unsafe fn worker(
                         &global_injector,
                         &mut dispatch_counter,
                         local_stack_limit,
-                        &fd_budget,
                         &mut name_cbuf,
                         &active_count,
-                        collect_syscall_stats,
                         &mut sys_stats,
                     );
                 } else if ent.d_type == DT_REG {
@@ -785,7 +679,6 @@ unsafe fn worker(
                         name_cbuf.as_ptr() as *const i8,
                         &mut st,
                         libc::AT_SYMLINK_NOFOLLOW,
-                        collect_syscall_stats,
                         &mut sys_stats,
                     );
                     if stat_rc == 0 {
@@ -805,10 +698,8 @@ unsafe fn worker(
                                     &global_injector,
                                     &mut dispatch_counter,
                                     local_stack_limit,
-                                    &fd_budget,
                                     &mut name_cbuf,
                                     &active_count,
-                                    collect_syscall_stats,
                                     &mut sys_stats,
                                 );
                             }
@@ -845,12 +736,7 @@ unsafe fn worker(
         }
 
         let _ = close(dirfd);
-        if collect_syscall_stats {
-            sys_stats.close_calls += 1;
-        }
-        if held_fd {
-            fd_budget.release();
-        }
+        sys_stats.close_calls += 1;
 
         // Decrement counter for this directory finishing
         // (subdirs were already incremented when queued)
@@ -866,9 +752,7 @@ unsafe fn worker(
         let _ = result_tx.send(ResultBatch::Count(pending_count));
     }
 
-    if collect_syscall_stats {
-        flush_local_sys_stats(&sys_stats);
-    }
+    flush_local_sys_stats(&sys_stats);
 }
 
 fn raise_nofile_soft_limit() {
@@ -952,7 +836,6 @@ pub struct ScanStats {
     pub openat_fails: u64,
     pub openat_ms: f64,
     pub close_calls: u64,
-    pub fd_budget_misses: u64,
     pub local_stack_pushes: u64,
     pub global_queue_spills: u64,
     pub cancel_skipped_dirs: u64,
@@ -984,7 +867,6 @@ impl ScanHandle {
             openat_fails: OPENAT_FAILS.load(Ordering::Relaxed),
             openat_ms: openat_nanos as f64 / 1_000_000.0,
             close_calls: CLOSE_CALLS.load(Ordering::Relaxed),
-            fd_budget_misses: FD_BUDGET_MISSES.load(Ordering::Relaxed),
             local_stack_pushes: LOCAL_STACK_PUSHES.load(Ordering::Relaxed),
             global_queue_spills: GLOBAL_QUEUE_SPILLS.load(Ordering::Relaxed),
             cancel_skipped_dirs: CANCEL_SKIPPED_DIRS.load(Ordering::Relaxed),
@@ -1011,7 +893,6 @@ pub fn scan(
     filter: FileFilter,
     options: ScanOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
-    collect_syscall_stats: bool,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
     raise_nofile_soft_limit();
@@ -1026,7 +907,6 @@ pub fn scan(
     OPENAT_FAILS.store(0, Ordering::Relaxed);
     OPENAT_NANOS.store(0, Ordering::Relaxed);
     CLOSE_CALLS.store(0, Ordering::Relaxed);
-    FD_BUDGET_MISSES.store(0, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.store(0, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.store(0, Ordering::Relaxed);
     CANCEL_SKIPPED_DIRS.store(0, Ordering::Relaxed);
@@ -1044,7 +924,6 @@ pub fn scan(
     root_c.push(0);
 
     let fd_limit = detect_fd_limit();
-    let fd_budget = Arc::new(FdBudget::new(fd_limit));
 
     // Ensure root directory can be opened up-front
     let mut root_stats = LocalSysStats::default();
@@ -1054,13 +933,10 @@ pub fn scan(
             root_c.as_ptr() as *const i8,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
             true,
-            collect_syscall_stats,
             &mut root_stats,
         );
         if fd < 0 {
-            if collect_syscall_stats {
-                flush_local_sys_stats(&root_stats);
-            }
+            flush_local_sys_stats(&root_stats);
             eprintln!("cannot open root: {root_path}");
             let (_, rx) = unbounded::<ResultBatch>();
             return ScanHandle {
@@ -1087,27 +963,13 @@ pub fn scan(
             .collect::<Vec<_>>(),
     );
 
-    // Kick off with root (depth 1)
-    let root_item = if fd_budget.try_acquire() {
-        WorkItem {
-            path: root_path,
-            dirfd: Some(root_fd),
-            depth: 1,
-        }
-    } else {
-        let _ = unsafe { close(root_fd) };
-        if collect_syscall_stats {
-            root_stats.close_calls += 1;
-        }
-        WorkItem {
-            path: root_path,
-            dirfd: None,
-            depth: 1,
-        }
+    // Kick off with root (depth 1). Work items always carry an open directory fd.
+    let root_item = WorkItem {
+        path: root_path,
+        dirfd: root_fd,
+        depth: 1,
     };
-    if collect_syscall_stats {
-        flush_local_sys_stats(&root_stats);
-    }
+    flush_local_sys_stats(&root_stats);
     global_injector.push(root_item);
 
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
@@ -1120,7 +982,6 @@ pub fn scan(
         let ac = active.clone();
         let deques = stealers.clone();
         let injector = global_injector.clone();
-        let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
         let stack_limit = local_stack_limit;
         let opts = scan_options.clone();
@@ -1133,14 +994,12 @@ pub fn scan(
                 injector,
                 rtx,
                 ac,
-                fd_mgr,
                 list_mode,
                 max_depth,
                 flt,
                 stack_limit,
                 opts,
                 cancel,
-                collect_syscall_stats,
             )
         }));
     }
