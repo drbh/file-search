@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "f")]
-#[command(about = "Fast file search using macOS getattrlistbulk", long_about = None)]
+#[command(about = "Fast file search using direct macOS directory syscalls", long_about = None)]
 struct Cli {
     /// Directory to search (defaults to current directory)
     #[arg(default_value = ".")]
@@ -438,10 +438,6 @@ fn run() -> io::Result<()> {
     if cli.stats && !cli.quiet {
         eprintln!("Found {} files in {:.2?}", total, stats.duration);
         eprintln!("--- Statistics ---");
-        eprintln!("getattrlistbulk calls: {}", stats.getattr_calls);
-        eprintln!("entries returned:      {}", stats.getattr_entries);
-        eprintln!("avg entries/call:      {:.1}", stats.avg_entries_per_call());
-        eprintln!("getattr errors:        {}", stats.getattr_errors);
         eprintln!("fstatat calls:         {}", stats.fstatat_calls);
         eprintln!("fstatat failures:      {}", stats.fstatat_fails);
         eprintln!("openat calls:          {}", stats.openat_calls);
@@ -452,11 +448,7 @@ fn run() -> io::Result<()> {
         eprintln!("openat failures:       {}", stats.openat_fails);
         eprintln!("close calls:           {}", stats.close_calls);
         eprintln!("openat time:           {:.2} ms", stats.openat_ms);
-        eprintln!("getattr time:          {:.2} ms", stats.getattr_ms);
         eprintln!("fstatat time:          {:.2} ms", stats.fstatat_ms);
-        eprintln!("rdahead calls:         {}", stats.rdahead_calls);
-        eprintln!("rdahead failures:      {}", stats.rdahead_fails);
-        eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
         eprintln!("fd budget misses:      {}", stats.fd_budget_misses);
         eprintln!("local stack pushes:    {}", stats.local_stack_pushes);
         eprintln!("global queue spills:   {}", stats.global_queue_spills);
