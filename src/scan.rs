@@ -74,7 +74,7 @@ const FD_MIN_LIMIT: usize = 64;
 const FD_MAX_LIMIT: usize = 262144;
 const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
 const PATH_RESULT_BATCH_SIZE: usize = 4096;
-const LOCAL_WORK_STACK_LIMIT: usize = 64;
+const LOCAL_WORK_STACK_LIMIT_DEFAULT: usize = 32;
 const RLIMIT_NOFILE: i32 = 8;
 const RLIM_INFINITY: u64 = !0;
 
@@ -581,6 +581,7 @@ unsafe fn schedule_child_directory(
     max_depth: usize,
     path_buf: &mut PathScratch,
     local_stack: &mut Vec<WorkItem>,
+    local_stack_limit: usize,
     fd_budget: &FdBudget,
     name_cbuf: &mut Vec<u8>,
     work_tx: &crossbeam_channel::Sender<WorkMsg>,
@@ -595,7 +596,7 @@ unsafe fn schedule_child_directory(
     }
 
     let composed = path_buf.compose(name).to_owned();
-    if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
+    if local_stack.len() < local_stack_limit {
         let mut next_fd: Option<RawFd> = None;
         if fd_budget.try_acquire() {
             name_cbuf.clear();
@@ -658,6 +659,7 @@ unsafe fn worker(
     max_depth: usize,
     filter: FileFilter,
     dir_backend: DirBackend,
+    local_stack_limit: usize,
     scan_options: Arc<ScanOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
     collect_syscall_stats: bool,
@@ -665,7 +667,8 @@ unsafe fn worker(
     // Thread-local reusable buffers
     let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
     let mut sys_stats = LocalSysStats::default();
-    let enable_rdahead = std::env::var_os("FILE_SEARCH_DISABLE_RDAHEAD").is_none();
+    let enable_rdahead = std::env::var_os("FILE_SEARCH_ENABLE_RDAHEAD").is_some()
+        && std::env::var_os("FILE_SEARCH_DISABLE_RDAHEAD").is_none();
 
     // Only request what we need: NAME + OBJTYPE + RETURNED_ATTRS (required for getattrlistbulk)
     let al = attrlist {
@@ -682,7 +685,7 @@ unsafe fn worker(
     let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
-    let mut local_stack: Vec<WorkItem> = Vec::with_capacity(LOCAL_WORK_STACK_LIMIT);
+    let mut local_stack: Vec<WorkItem> = Vec::with_capacity(local_stack_limit);
     let has_cancel = cancel_flag.is_some();
 
     loop {
@@ -787,6 +790,7 @@ unsafe fn worker(
                             max_depth,
                             &mut path_buf,
                             &mut local_stack,
+                            local_stack_limit,
                             &fd_budget,
                             &mut name_cbuf,
                             &work_tx,
@@ -843,6 +847,7 @@ unsafe fn worker(
                                     max_depth,
                                     &mut path_buf,
                                     &mut local_stack,
+                                    local_stack_limit,
                                     &fd_budget,
                                     &mut name_cbuf,
                                     &work_tx,
@@ -962,6 +967,7 @@ unsafe fn worker(
                             max_depth,
                             &mut path_buf,
                             &mut local_stack,
+                            local_stack_limit,
                             &fd_budget,
                             &mut name_cbuf,
                             &work_tx,
@@ -1091,7 +1097,7 @@ fn resolve_dir_backend() -> DirBackend {
     DirBackend::Dirent
 }
 
-fn resolve_scan_workers(fd_limit: usize) -> usize {
+fn resolve_scan_workers(fd_limit: usize, dir_backend: DirBackend) -> usize {
     if let Ok(raw) = std::env::var("FILE_SEARCH_SCAN_WORKERS") {
         if let Ok(parsed) = raw.parse::<usize>() {
             return parsed.max(1);
@@ -1103,7 +1109,11 @@ fn resolve_scan_workers(fd_limit: usize) -> usize {
         .unwrap_or(4);
 
     let core_limited = if cfg!(target_arch = "aarch64") {
-        cores.min(6).max(2)
+        match dir_backend {
+            // dirent path benefits from slightly higher parallelism on APFS metadata scans
+            DirBackend::Dirent => cores.min(8).max(2),
+            DirBackend::GetAttrListBulk => cores.min(6).max(2),
+        }
     } else {
         cores.min(8).max(2)
     };
@@ -1116,6 +1126,15 @@ fn resolve_scan_workers(fd_limit: usize) -> usize {
     } else {
         core_limited
     }
+}
+
+fn resolve_local_stack_limit() -> usize {
+    if let Ok(raw) = std::env::var("FILE_SEARCH_LOCAL_STACK_LIMIT") {
+        if let Ok(parsed) = raw.parse::<usize>() {
+            return parsed.clamp(4, 1024);
+        }
+    }
+    LOCAL_WORK_STACK_LIMIT_DEFAULT
 }
 
 /// Runtime statistics from scanning
@@ -1273,9 +1292,10 @@ pub fn scan(
         fd
     };
 
-    // Worker count: cap to 8; avoid extra contention on APFS metadata
-    let workers = resolve_scan_workers(fd_limit);
     let dir_backend = resolve_dir_backend();
+    // Worker count: cap to avoid excess metadata contention.
+    let workers = resolve_scan_workers(fd_limit, dir_backend);
+    let local_stack_limit = resolve_local_stack_limit();
 
     let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
@@ -1291,6 +1311,7 @@ pub fn scan(
         let fd_mgr = fd_budget.clone();
         let flt = filter.clone();
         let backend = dir_backend;
+        let stack_limit = local_stack_limit;
         let opts = scan_options.clone();
         let cancel = cancel_flag.clone();
         handles.push(std::thread::spawn(move || unsafe {
@@ -1305,6 +1326,7 @@ pub fn scan(
                 max_depth,
                 flt,
                 backend,
+                stack_limit,
                 opts,
                 cancel,
                 collect_syscall_stats,
