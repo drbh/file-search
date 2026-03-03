@@ -32,7 +32,8 @@ extern "C" {
         size: usize,
         opts: u64,
     ) -> isize;
-    fn openat(dfd: i32, path: *const i8, oflag: i32, ...) -> i32;
+    #[link_name = "openat$NOCANCEL"]
+    fn c_openat_nocancel(dfd: i32, path: *const i8, oflag: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getdtablesize() -> i32;
@@ -109,6 +110,9 @@ static OPENAT_FAILS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static GETATTR_NANOS: AtomicU64 = AtomicU64::new(0);
 static GETATTR_ERRORS: AtomicU64 = AtomicU64::new(0);
+static FSTATAT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSTATAT_FAILS: AtomicU64 = AtomicU64::new(0);
+static FSTATAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_CALLS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_FAILS: AtomicU64 = AtomicU64::new(0);
 static RDAHEAD_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -123,6 +127,9 @@ struct LocalSysStats {
     getattr_calls: u64,
     getattr_entries: u64,
     getattr_errors: u64,
+    fstatat_calls: u64,
+    fstatat_fails: u64,
+    fstatat_nanos: u64,
     openat_calls: u64,
     openat_abs_calls: u64,
     openat_rel_calls: u64,
@@ -144,6 +151,9 @@ fn flush_local_sys_stats(stats: &LocalSysStats) {
     GETATTR_CALLS.fetch_add(stats.getattr_calls, Ordering::Relaxed);
     GETATTR_ENTRIES.fetch_add(stats.getattr_entries, Ordering::Relaxed);
     GETATTR_ERRORS.fetch_add(stats.getattr_errors, Ordering::Relaxed);
+    FSTATAT_CALLS.fetch_add(stats.fstatat_calls, Ordering::Relaxed);
+    FSTATAT_FAILS.fetch_add(stats.fstatat_fails, Ordering::Relaxed);
+    FSTATAT_NANOS.fetch_add(stats.fstatat_nanos, Ordering::Relaxed);
     OPENAT_CALLS.fetch_add(stats.openat_calls, Ordering::Relaxed);
     OPENAT_ABS_CALLS.fetch_add(stats.openat_abs_calls, Ordering::Relaxed);
     OPENAT_REL_CALLS.fetch_add(stats.openat_rel_calls, Ordering::Relaxed);
@@ -178,7 +188,7 @@ unsafe fn timed_openat(
 ) -> i32 {
     if collect_syscall_stats {
         let start = Instant::now();
-        let fd = openat(dfd, path, oflag);
+        let fd = c_openat_nocancel(dfd, path, oflag);
         stats.openat_calls += 1;
         if absolute {
             stats.openat_abs_calls += 1;
@@ -191,7 +201,7 @@ unsafe fn timed_openat(
         stats.openat_nanos += start.elapsed().as_nanos() as u64;
         fd
     } else {
-        openat(dfd, path, oflag)
+        c_openat_nocancel(dfd, path, oflag)
     }
 }
 
@@ -217,6 +227,29 @@ unsafe fn timed_getattrlistbulk(
         n
     } else {
         getattrlistbulk(dirfd, al, buf, size, 0)
+    }
+}
+
+#[inline]
+unsafe fn timed_fstatat(
+    dfd: i32,
+    path: *const i8,
+    stat_buf: *mut libc::stat,
+    flags: i32,
+    collect_syscall_stats: bool,
+    stats: &mut LocalSysStats,
+) -> i32 {
+    if collect_syscall_stats {
+        let start = Instant::now();
+        let rc = libc::fstatat(dfd, path, stat_buf, flags);
+        stats.fstatat_calls += 1;
+        if rc < 0 {
+            stats.fstatat_fails += 1;
+        }
+        stats.fstatat_nanos += start.elapsed().as_nanos() as u64;
+        rc
+    } else {
+        libc::fstatat(dfd, path, stat_buf, flags)
     }
 }
 
@@ -670,14 +703,19 @@ unsafe fn worker(
     let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
     let mut dispatch_counter: usize = worker_index;
     let has_cancel = cancel_flag.is_some();
+    let mut idle_polls: u32 = 0;
 
     loop {
         let work = loop {
             if let Some(local) = local_deque.pop() {
+                idle_polls = 0;
                 break Some(local);
             }
             match global_injector.steal_batch_and_pop(&local_deque) {
-                Steal::Success(item) => break Some(item),
+                Steal::Success(item) => {
+                    idle_polls = 0;
+                    break Some(item);
+                }
                 Steal::Retry => continue,
                 Steal::Empty => {}
             }
@@ -697,13 +735,23 @@ unsafe fn worker(
                 }
             }
             if stolen.is_some() {
+                idle_polls = 0;
                 break stolen;
             }
 
             if active_count.load(Ordering::Acquire) == 0 {
                 break None;
             }
-            std::thread::yield_now();
+
+            // Back off once workers are idle to reduce scheduler churn.
+            idle_polls = idle_polls.saturating_add(1);
+            if idle_polls <= 8 {
+                std::hint::spin_loop();
+            } else if idle_polls <= 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(50));
+            }
         };
         let Some(work) = work else {
             break;
@@ -845,46 +893,67 @@ unsafe fn worker(
                             }
                         }
                     } else if ent.d_type == DT_UNKNOWN {
-                        // Unknown type: probe directory cheaply with openat(O_DIRECTORY).
+                        // Unknown type: classify with fstatat to avoid open+close probing.
                         name_cbuf.clear();
                         name_cbuf.extend_from_slice(name_bytes);
                         name_cbuf.push(0);
-                        let maybe_dir_fd = timed_openat(
+                        let mut st: libc::stat = std::mem::zeroed();
+                        let stat_rc = timed_fstatat(
                             dirfd,
                             name_cbuf.as_ptr() as *const i8,
-                            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                            false,
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
                             collect_syscall_stats,
                             &mut sys_stats,
                         );
-                        if maybe_dir_fd >= 0 {
-                            let _ = close(maybe_dir_fd);
-                            if collect_syscall_stats {
-                                sys_stats.close_calls += 1;
-                            }
-                            // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
-                            let name = std::str::from_utf8_unchecked(name_bytes);
-                            if !scan_options.should_skip_dir(&path, name) {
-                                schedule_child_directory(
-                                    dirfd,
-                                    name,
-                                    depth,
-                                    max_depth,
-                                    &mut path_buf,
-                                    &local_deque,
-                                    &global_injector,
-                                    &mut dispatch_counter,
-                                    local_stack_limit,
-                                    &fd_budget,
-                                    &mut name_cbuf,
-                                    &active_count,
-                                    collect_syscall_stats,
-                                    &mut sys_stats,
-                                );
+                        if stat_rc == 0 {
+                            let mode = st.st_mode as libc::mode_t;
+                            let file_type = mode & (libc::S_IFMT as libc::mode_t);
+                            if file_type == (libc::S_IFDIR as libc::mode_t) {
+                                // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                                let name = std::str::from_utf8_unchecked(name_bytes);
+                                if !scan_options.should_skip_dir(&path, name) {
+                                    schedule_child_directory(
+                                        dirfd,
+                                        name,
+                                        depth,
+                                        max_depth,
+                                        &mut path_buf,
+                                        &local_deque,
+                                        &global_injector,
+                                        &mut dispatch_counter,
+                                        local_stack_limit,
+                                        &fd_budget,
+                                        &mut name_cbuf,
+                                        &active_count,
+                                        collect_syscall_stats,
+                                        &mut sys_stats,
+                                    );
+                                }
+                            } else if file_type == (libc::S_IFREG as libc::mode_t)
+                                && filter.matches_bytes(name_bytes)
+                            {
+                                if list_mode {
+                                    // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                                    let name = std::str::from_utf8_unchecked(name_bytes);
+                                    let composed = path_buf.compose(name).to_owned();
+                                    pending_paths.push(composed);
+                                    if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
+                                        let batch = std::mem::take(&mut pending_paths);
+                                        let _ = result_tx.send(ResultBatch::Paths(batch));
+                                        pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+                                    }
+                                } else {
+                                    pending_count += 1;
+                                    if pending_count >= COUNT_RESULT_BATCH_SIZE {
+                                        let _ = result_tx.send(ResultBatch::Count(pending_count));
+                                        pending_count = 0;
+                                    }
+                                }
                             }
                         } else if filter.matches_bytes(name_bytes) {
                             if list_mode {
-                                // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                                // Preserve prior fallback behavior on stat errors.
                                 let name = std::str::from_utf8_unchecked(name_bytes);
                                 let composed = path_buf.compose(name).to_owned();
                                 pending_paths.push(composed);
@@ -1130,8 +1199,8 @@ fn resolve_scan_workers(fd_limit: usize, dir_backend: DirBackend) -> usize {
 
     let core_limited = if cfg!(target_arch = "aarch64") {
         match dir_backend {
-            // dirent path benefits from slightly higher parallelism on APFS metadata scans
-            DirBackend::Dirent => cores.min(8).max(2),
+            // Metadata-heavy directory scans tend to saturate before full core count.
+            DirBackend::Dirent => cores.min(6).max(2),
             DirBackend::GetAttrListBulk => cores.min(6).max(2),
         }
     } else {
@@ -1164,6 +1233,9 @@ pub struct ScanStats {
     pub getattr_calls: u64,
     pub getattr_entries: u64,
     pub getattr_errors: u64,
+    pub fstatat_calls: u64,
+    pub fstatat_fails: u64,
+    pub fstatat_ms: f64,
     pub openat_calls: u64,
     pub openat_abs_calls: u64,
     pub openat_rel_calls: u64,
@@ -1204,6 +1276,7 @@ impl ScanHandle {
 
         let openat_nanos = OPENAT_NANOS.load(Ordering::Relaxed);
         let getattr_nanos = GETATTR_NANOS.load(Ordering::Relaxed);
+        let fstatat_nanos = FSTATAT_NANOS.load(Ordering::Relaxed);
         let rdahead_nanos = RDAHEAD_NANOS.load(Ordering::Relaxed);
 
         ScanStats {
@@ -1211,6 +1284,9 @@ impl ScanHandle {
             getattr_calls: GETATTR_CALLS.load(Ordering::Relaxed),
             getattr_entries: GETATTR_ENTRIES.load(Ordering::Relaxed),
             getattr_errors: GETATTR_ERRORS.load(Ordering::Relaxed),
+            fstatat_calls: FSTATAT_CALLS.load(Ordering::Relaxed),
+            fstatat_fails: FSTATAT_FAILS.load(Ordering::Relaxed),
+            fstatat_ms: fstatat_nanos as f64 / 1_000_000.0,
             openat_calls: OPENAT_CALLS.load(Ordering::Relaxed),
             openat_abs_calls: OPENAT_ABS_CALLS.load(Ordering::Relaxed),
             openat_rel_calls: OPENAT_REL_CALLS.load(Ordering::Relaxed),
@@ -1257,6 +1333,9 @@ pub fn scan(
     GETATTR_CALLS.store(0, Ordering::Relaxed);
     GETATTR_ENTRIES.store(0, Ordering::Relaxed);
     GETATTR_ERRORS.store(0, Ordering::Relaxed);
+    FSTATAT_CALLS.store(0, Ordering::Relaxed);
+    FSTATAT_FAILS.store(0, Ordering::Relaxed);
+    FSTATAT_NANOS.store(0, Ordering::Relaxed);
     OPENAT_CALLS.store(0, Ordering::Relaxed);
     OPENAT_ABS_CALLS.store(0, Ordering::Relaxed);
     OPENAT_REL_CALLS.store(0, Ordering::Relaxed);

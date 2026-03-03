@@ -442,6 +442,8 @@ fn run() -> io::Result<()> {
         eprintln!("entries returned:      {}", stats.getattr_entries);
         eprintln!("avg entries/call:      {:.1}", stats.avg_entries_per_call());
         eprintln!("getattr errors:        {}", stats.getattr_errors);
+        eprintln!("fstatat calls:         {}", stats.fstatat_calls);
+        eprintln!("fstatat failures:      {}", stats.fstatat_fails);
         eprintln!("openat calls:          {}", stats.openat_calls);
         eprintln!(
             "openat abs/rel:        {}/{}",
@@ -451,6 +453,7 @@ fn run() -> io::Result<()> {
         eprintln!("close calls:           {}", stats.close_calls);
         eprintln!("openat time:           {:.2} ms", stats.openat_ms);
         eprintln!("getattr time:          {:.2} ms", stats.getattr_ms);
+        eprintln!("fstatat time:          {:.2} ms", stats.fstatat_ms);
         eprintln!("rdahead calls:         {}", stats.rdahead_calls);
         eprintln!("rdahead failures:      {}", stats.rdahead_fails);
         eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
