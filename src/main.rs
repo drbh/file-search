@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "f")]
-#[command(about = "Fast file search using macOS getattrlistbulk", long_about = None)]
+#[command(about = "Fast file search using direct macOS directory syscalls", long_about = None)]
 struct Cli {
     /// Directory to search (defaults to current directory)
     #[arg(default_value = ".")]
@@ -255,18 +255,38 @@ fn run() -> io::Result<()> {
         .as_ref()
         .map(|value| value.to_ascii_lowercase().into_bytes().into_boxed_slice());
 
-    let filter =
-        if extensions.is_some() || !contains_all.is_empty() || prefix.is_some() || suffix.is_some()
-        {
-            FileFilter::Composite {
-                extensions,
-                contains_all,
-                prefix,
-                suffix,
-            }
-        } else {
-            FileFilter::All
-        };
+    let use_ext_only_fast_path = prefix.is_none()
+        && suffix.is_none()
+        && contains_all.is_empty()
+        && extensions.as_ref().is_some_and(|exts| exts.len() == 1);
+    let use_ext_contains_fast_path = prefix.is_none()
+        && suffix.is_none()
+        && contains_all.len() == 1
+        && extensions.as_ref().is_some_and(|exts| exts.len() == 1);
+
+    let filter = if use_ext_only_fast_path {
+        FileFilter::ExtOnly {
+            ext: extensions.as_ref().unwrap()[0].clone(),
+        }
+    } else if use_ext_contains_fast_path {
+        FileFilter::ExtAndContains {
+            ext: extensions.as_ref().unwrap()[0].clone(),
+            needle: contains_all[0].clone(),
+        }
+    } else if extensions.is_some()
+        || !contains_all.is_empty()
+        || prefix.is_some()
+        || suffix.is_some()
+    {
+        FileFilter::Composite {
+            extensions,
+            contains_all,
+            prefix,
+            suffix,
+        }
+    } else {
+        FileFilter::All
+    };
 
     // Resolve to absolute path
     let path = std::fs::canonicalize(&path_arg).unwrap_or_else(|_| PathBuf::from(&path_arg));
@@ -326,7 +346,6 @@ fn run() -> io::Result<()> {
             cli.binary,
             mtime_filter,
             cli.workers,
-            cli.stats,
         )?;
 
         if !cli.list {
@@ -372,7 +391,6 @@ fn run() -> io::Result<()> {
         filter,
         scan_options,
         None,
-        cli.stats,
     );
 
     let mut total: usize = 0;
@@ -401,7 +419,7 @@ fn run() -> io::Result<()> {
                         let clamped =
                             clamp_list_path_segments(&p, &path, cli.segments.unwrap_or(0));
                         if seen.insert(clamped.clone()) {
-                            let _ = writeln!(writer, "{}", clamped);
+                            let _ = writeln!(writer, "{clamped}");
                         }
                     }
                 } else if cli.list {
@@ -412,7 +430,7 @@ fn run() -> io::Result<()> {
                             }
                         }
                         total += 1;
-                        let _ = writeln!(writer, "{}", p);
+                        let _ = writeln!(writer, "{p}");
                     }
                 } else {
                     for p in paths {
@@ -432,16 +450,14 @@ fn run() -> io::Result<()> {
     let stats = handle.wait_for_completion();
 
     if !cli.list {
-        println!("{}", total);
+        println!("{total}");
     }
 
     if cli.stats && !cli.quiet {
         eprintln!("Found {} files in {:.2?}", total, stats.duration);
         eprintln!("--- Statistics ---");
-        eprintln!("getattrlistbulk calls: {}", stats.getattr_calls);
-        eprintln!("entries returned:      {}", stats.getattr_entries);
-        eprintln!("avg entries/call:      {:.1}", stats.avg_entries_per_call());
-        eprintln!("getattr errors:        {}", stats.getattr_errors);
+        eprintln!("fstatat calls:         {}", stats.fstatat_calls);
+        eprintln!("fstatat failures:      {}", stats.fstatat_fails);
         eprintln!("openat calls:          {}", stats.openat_calls);
         eprintln!(
             "openat abs/rel:        {}/{}",
@@ -449,12 +465,6 @@ fn run() -> io::Result<()> {
         );
         eprintln!("openat failures:       {}", stats.openat_fails);
         eprintln!("close calls:           {}", stats.close_calls);
-        eprintln!("openat time:           {:.2} ms", stats.openat_ms);
-        eprintln!("getattr time:          {:.2} ms", stats.getattr_ms);
-        eprintln!("rdahead calls:         {}", stats.rdahead_calls);
-        eprintln!("rdahead failures:      {}", stats.rdahead_fails);
-        eprintln!("rdahead time:          {:.2} ms", stats.rdahead_ms);
-        eprintln!("fd budget misses:      {}", stats.fd_budget_misses);
         eprintln!("local stack pushes:    {}", stats.local_stack_pushes);
         eprintln!("global queue spills:   {}", stats.global_queue_spills);
         eprintln!("cancel-skipped dirs:   {}", stats.cancel_skipped_dirs);
@@ -464,7 +474,7 @@ fn run() -> io::Result<()> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("error: {}", err);
+        eprintln!("error: {err}");
         std::process::exit(1);
     }
 }

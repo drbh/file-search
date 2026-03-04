@@ -13,14 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
 clap = { version = "4", features = ["derive"] }
 memchr = "2.7"
+libc = "0.2"
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[profile.profiling]
-inherits = "release"
-debug = true

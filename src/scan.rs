@@ -1,110 +1,72 @@
 use crossbeam_channel::unbounded;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
+use libc::dirent;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::{mem, ptr};
-
-#[repr(C)]
-struct attrlist {
-    bitmapcount: u16,
-    reserved: u16,
-    commonattr: u32,
-    volattr: u32,
-    dirattr: u32,
-    fileattr: u32,
-    forkattr: u32,
-}
-#[repr(C)]
-struct attrreference {
-    off: i32,
-    len: u32,
-}
+use std::time::Duration;
 
 #[link(name = "System")]
 extern "C" {
-    fn getattrlistbulk(
-        dirfd: i32,
-        al: *const attrlist,
-        buf: *mut core::ffi::c_void,
-        size: usize,
-        opts: u64,
-    ) -> isize;
-    fn openat(dfd: i32, path: *const i8, oflag: i32, ...) -> i32;
+    #[link_name = "openat$NOCANCEL"]
+    fn c_openat_nocancel(dfd: i32, path: *const i8, oflag: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
-    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getdtablesize() -> i32;
+    #[link_name = "__getdirentries64"]
+    fn c_getdirentries64(
+        fd: i32,
+        buf: *mut core::ffi::c_void,
+        nbytes: usize,
+        basep: *mut libc::off_t,
+    ) -> isize;
+    fn getrlimit(resource: i32, rlp: *mut rlimit) -> i32;
+    fn setrlimit(resource: i32, rlp: *const rlimit) -> i32;
 }
-
-#[inline]
-unsafe fn read_u32_unaligned(p: *const u8) -> u32 {
-    ptr::read_unaligned(p.cast())
-}
-
-#[inline]
-unsafe fn read_attrref_unaligned(p: *const u8) -> attrreference {
-    ptr::read_unaligned(p.cast())
-}
-
-const ATTR_BIT_MAP_COUNT: u16 = 5;
-const ATTR_CMN_NAME: u32 = 0x00000001;
-const ATTR_CMN_OBJTYPE: u32 = 0x00000008;
-const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
 
 const O_RDONLY: i32 = 0x0000;
 const O_DIRECTORY: i32 = 0x100000;
 const O_CLOEXEC: i32 = 0x01000000;
 const AT_FDCWD: i32 = -2;
-const F_RDAHEAD: i32 = 45;
-const INITIAL_BULK_BUF_SIZE: usize = 4 << 20;
-const MAX_BULK_BUF_SIZE: usize = 16 << 20;
-const BULK_EXPAND_SLACK: usize = 128 << 10; // grow when buffer nearly full
 const DEFAULT_FD_LIMIT: usize = 1024;
 const FD_HEADROOM: usize = 64;
 const FD_MIN_LIMIT: usize = 64;
-const FD_MAX_LIMIT: usize = 65536;
+const FD_MAX_LIMIT: usize = 262144;
 const COUNT_RESULT_BATCH_SIZE: usize = 1 << 18;
 const PATH_RESULT_BATCH_SIZE: usize = 4096;
-const LOCAL_WORK_STACK_LIMIT: usize = 8;
+const LOCAL_WORK_STACK_LIMIT_DEFAULT: usize = 32;
+const DIRENT_BUF_SIZE: usize = 256 << 10;
+const RLIMIT_NOFILE: i32 = 8;
+const RLIM_INFINITY: u64 = !0;
 
-// Darwin vtype constants
-const VREG: u32 = 1;
-const VDIR: u32 = 2;
+#[repr(C)]
+struct rlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
 
-static GETATTR_CALLS: AtomicU64 = AtomicU64::new(0);
-static GETATTR_ENTRIES: AtomicU64 = AtomicU64::new(0);
+const DT_UNKNOWN: u8 = 0;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
 static OPENAT_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_ABS_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_REL_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_FAILS: AtomicU64 = AtomicU64::new(0);
-static OPENAT_NANOS: AtomicU64 = AtomicU64::new(0);
-static GETATTR_NANOS: AtomicU64 = AtomicU64::new(0);
-static GETATTR_ERRORS: AtomicU64 = AtomicU64::new(0);
-static RDAHEAD_CALLS: AtomicU64 = AtomicU64::new(0);
-static RDAHEAD_FAILS: AtomicU64 = AtomicU64::new(0);
-static RDAHEAD_NANOS: AtomicU64 = AtomicU64::new(0);
+static FSTATAT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSTATAT_FAILS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
-static FD_BUDGET_MISSES: AtomicU64 = AtomicU64::new(0);
 static LOCAL_STACK_PUSHES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_QUEUE_SPILLS: AtomicU64 = AtomicU64::new(0);
 static CANCEL_SKIPPED_DIRS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct LocalSysStats {
-    getattr_calls: u64,
-    getattr_entries: u64,
-    getattr_errors: u64,
+    fstatat_calls: u64,
+    fstatat_fails: u64,
     openat_calls: u64,
     openat_abs_calls: u64,
     openat_rel_calls: u64,
     openat_fails: u64,
-    openat_nanos: u64,
-    getattr_nanos: u64,
-    rdahead_calls: u64,
-    rdahead_fails: u64,
-    rdahead_nanos: u64,
     close_calls: u64,
-    fd_budget_misses: u64,
     local_stack_pushes: u64,
     global_queue_spills: u64,
     cancel_skipped_dirs: u64,
@@ -112,20 +74,13 @@ struct LocalSysStats {
 
 #[inline]
 fn flush_local_sys_stats(stats: &LocalSysStats) {
-    GETATTR_CALLS.fetch_add(stats.getattr_calls, Ordering::Relaxed);
-    GETATTR_ENTRIES.fetch_add(stats.getattr_entries, Ordering::Relaxed);
-    GETATTR_ERRORS.fetch_add(stats.getattr_errors, Ordering::Relaxed);
+    FSTATAT_CALLS.fetch_add(stats.fstatat_calls, Ordering::Relaxed);
+    FSTATAT_FAILS.fetch_add(stats.fstatat_fails, Ordering::Relaxed);
     OPENAT_CALLS.fetch_add(stats.openat_calls, Ordering::Relaxed);
     OPENAT_ABS_CALLS.fetch_add(stats.openat_abs_calls, Ordering::Relaxed);
     OPENAT_REL_CALLS.fetch_add(stats.openat_rel_calls, Ordering::Relaxed);
     OPENAT_FAILS.fetch_add(stats.openat_fails, Ordering::Relaxed);
-    OPENAT_NANOS.fetch_add(stats.openat_nanos, Ordering::Relaxed);
-    GETATTR_NANOS.fetch_add(stats.getattr_nanos, Ordering::Relaxed);
-    RDAHEAD_CALLS.fetch_add(stats.rdahead_calls, Ordering::Relaxed);
-    RDAHEAD_FAILS.fetch_add(stats.rdahead_fails, Ordering::Relaxed);
-    RDAHEAD_NANOS.fetch_add(stats.rdahead_nanos, Ordering::Relaxed);
     CLOSE_CALLS.fetch_add(stats.close_calls, Ordering::Relaxed);
-    FD_BUDGET_MISSES.fetch_add(stats.fd_budget_misses, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.fetch_add(stats.local_stack_pushes, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.fetch_add(stats.global_queue_spills, Ordering::Relaxed);
     CANCEL_SKIPPED_DIRS.fetch_add(stats.cancel_skipped_dirs, Ordering::Relaxed);
@@ -144,66 +99,35 @@ unsafe fn timed_openat(
     path: *const i8,
     oflag: i32,
     absolute: bool,
-    collect_syscall_stats: bool,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    if collect_syscall_stats {
-        let start = Instant::now();
-        let fd = openat(dfd, path, oflag);
-        stats.openat_calls += 1;
-        if absolute {
-            stats.openat_abs_calls += 1;
-        } else {
-            stats.openat_rel_calls += 1;
-        }
-        if fd < 0 {
-            stats.openat_fails += 1;
-        }
-        stats.openat_nanos += start.elapsed().as_nanos() as u64;
-        fd
+    let fd = c_openat_nocancel(dfd, path, oflag);
+    stats.openat_calls += 1;
+    if absolute {
+        stats.openat_abs_calls += 1;
     } else {
-        openat(dfd, path, oflag)
+        stats.openat_rel_calls += 1;
     }
+    if fd < 0 {
+        stats.openat_fails += 1;
+    }
+    fd
 }
 
 #[inline]
-unsafe fn timed_getattrlistbulk(
-    dirfd: i32,
-    al: *const attrlist,
-    buf: *mut core::ffi::c_void,
-    size: usize,
-    collect_syscall_stats: bool,
+unsafe fn timed_fstatat(
+    dfd: i32,
+    path: *const i8,
+    stat_buf: *mut libc::stat,
+    flags: i32,
     stats: &mut LocalSysStats,
-) -> isize {
-    if collect_syscall_stats {
-        let start = Instant::now();
-        let n = getattrlistbulk(dirfd, al, buf, size, 0);
-        stats.getattr_calls += 1;
-        if n > 0 {
-            stats.getattr_entries += n as u64;
-        } else if n < 0 {
-            stats.getattr_errors += 1;
-        }
-        stats.getattr_nanos += start.elapsed().as_nanos() as u64;
-        n
-    } else {
-        getattrlistbulk(dirfd, al, buf, size, 0)
+) -> i32 {
+    let rc = libc::fstatat(dfd, path, stat_buf, flags);
+    stats.fstatat_calls += 1;
+    if rc < 0 {
+        stats.fstatat_fails += 1;
     }
-}
-
-#[inline]
-unsafe fn timed_set_rdahead(fd: i32, collect_syscall_stats: bool, stats: &mut LocalSysStats) {
-    if collect_syscall_stats {
-        let start = Instant::now();
-        let rc = fcntl(fd, F_RDAHEAD, 1);
-        stats.rdahead_calls += 1;
-        if rc < 0 {
-            stats.rdahead_fails += 1;
-        }
-        stats.rdahead_nanos += start.elapsed().as_nanos() as u64;
-    } else {
-        let _ = fcntl(fd, F_RDAHEAD, 1);
-    }
+    rc
 }
 
 #[derive(Clone)]
@@ -285,7 +209,11 @@ impl ScanOptions {
         if self.prune_defaults && is_default_prune_dir(name) {
             return true;
         }
-        if !self.ignore_dir_names.is_empty() && self.ignore_dir_names.iter().any(|dir| dir == name)
+        if !self.ignore_dir_names.is_empty()
+            && self
+                .ignore_dir_names
+                .binary_search_by(|dir| dir.as_str().cmp(name))
+                .is_ok()
         {
             return true;
         }
@@ -310,13 +238,8 @@ impl ScanOptions {
 
 struct WorkItem {
     path: String,
-    dirfd: Option<RawFd>,
+    dirfd: RawFd,
     depth: usize,
-}
-
-enum WorkMsg {
-    Dir(WorkItem),
-    Shutdown,
 }
 
 struct PathScratch {
@@ -353,53 +276,9 @@ pub enum ResultBatch {
     Paths(Vec<String>),
 }
 
-struct FdBudget {
-    limit: usize,
-    in_use: AtomicUsize,
-}
-
-impl FdBudget {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            in_use: AtomicUsize::new(0),
-        }
-    }
-
-    fn try_acquire(&self) -> bool {
-        let mut current = self.in_use.load(Ordering::Relaxed);
-        loop {
-            if current >= self.limit {
-                return false;
-            }
-            match self.in_use.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn release(&self) {
-        self.in_use.fetch_sub(1, Ordering::Release);
-    }
-}
-
 #[inline]
-fn mark_work_complete(
-    active_count: &AtomicUsize,
-    work_tx: &crossbeam_channel::Sender<WorkMsg>,
-    workers: usize,
-) {
-    if active_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-        for _ in 0..workers {
-            let _ = work_tx.send(WorkMsg::Shutdown);
-        }
-    }
+fn mark_work_complete(active_count: &AtomicUsize) {
+    active_count.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// File filter configuration
@@ -407,6 +286,10 @@ fn mark_work_complete(
 pub enum FileFilter {
     /// Match all regular files
     All,
+    /// Fast path: single extension check
+    ExtOnly { ext: Box<[u8]> },
+    /// Fast path: single extension + single contains check
+    ExtAndContains { ext: Box<[u8]>, needle: Box<[u8]> },
     /// Match when all provided clauses pass (logical AND)
     Composite {
         extensions: Option<Vec<Box<[u8]>>>,
@@ -489,14 +372,21 @@ fn contains_ascii_fold(input: &[u8], needle_lower: &[u8]) -> bool {
 
 impl FileFilter {
     #[inline]
-    fn matches_extension(name_bytes: &[u8], exts: &[Box<[u8]>]) -> bool {
-        let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') else {
-            return false;
-        };
+    fn extension_slice(name_bytes: &[u8]) -> Option<&[u8]> {
+        let dot = name_bytes.iter().rposition(|&b| b == b'.')?;
         let ext = &name_bytes[dot + 1..];
         if ext.is_empty() {
-            return false;
+            None
+        } else {
+            Some(ext)
         }
+    }
+
+    #[inline]
+    fn matches_extension(name_bytes: &[u8], exts: &[Box<[u8]>]) -> bool {
+        let Some(ext) = Self::extension_slice(name_bytes) else {
+            return false;
+        };
         exts.iter().any(|e| eq_ascii_fold(ext, e))
     }
 
@@ -515,6 +405,18 @@ impl FileFilter {
     pub fn matches_bytes(&self, name_bytes: &[u8]) -> bool {
         match self {
             FileFilter::All => true,
+            FileFilter::ExtOnly { ext } => {
+                let Some(ext_slice) = Self::extension_slice(name_bytes) else {
+                    return false;
+                };
+                eq_ascii_fold(ext_slice, ext)
+            }
+            FileFilter::ExtAndContains { ext, needle } => {
+                let Some(ext_slice) = Self::extension_slice(name_bytes) else {
+                    return false;
+                };
+                eq_ascii_fold(ext_slice, ext) && contains_ascii_fold(name_bytes, needle)
+            }
             FileFilter::Composite {
                 extensions,
                 contains_all,
@@ -547,279 +449,311 @@ impl FileFilter {
     }
 }
 
+#[inline]
+fn emit_match(
+    list_mode: bool,
+    path_buf: &mut PathScratch,
+    name: &str,
+    pending_paths: &mut Vec<String>,
+    pending_count: &mut usize,
+    result_tx: &crossbeam_channel::Sender<ResultBatch>,
+) {
+    if list_mode {
+        let composed = path_buf.compose(name).to_owned();
+        pending_paths.push(composed);
+        if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
+            let batch = std::mem::take(pending_paths);
+            let _ = result_tx.send(ResultBatch::Paths(batch));
+            *pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+        }
+    } else {
+        *pending_count += 1;
+        if *pending_count >= COUNT_RESULT_BATCH_SIZE {
+            let _ = result_tx.send(ResultBatch::Count(*pending_count));
+            *pending_count = 0;
+        }
+    }
+}
+
+#[inline]
+unsafe fn schedule_child_directory(
+    parent_fd: i32,
+    name: &str,
+    name_cstr: *const i8,
+    depth: usize,
+    max_depth: usize,
+    path_buf: &mut PathScratch,
+    local_deque: &DequeWorker<WorkItem>,
+    global_injector: &Injector<WorkItem>,
+    spill_countdown: &mut usize,
+    local_stack_limit: usize,
+    active_count: &AtomicUsize,
+    sys_stats: &mut LocalSysStats,
+) {
+    let next_depth = depth + 1;
+    if max_depth > 0 && next_depth > max_depth {
+        return;
+    }
+
+    let child_fd = timed_openat(
+        parent_fd,
+        name_cstr,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        false,
+        sys_stats,
+    );
+    if child_fd < 0 {
+        return;
+    }
+
+    // Increment counter BEFORE queueing to prevent race with completion.
+    active_count.fetch_add(1, Ordering::Relaxed);
+    let child = WorkItem {
+        path: path_buf.compose(name).to_owned(),
+        dirfd: child_fd,
+        depth: next_depth,
+    };
+
+    *spill_countdown = spill_countdown.saturating_sub(1);
+    if *spill_countdown == 0 {
+        global_injector.push(child);
+        sys_stats.global_queue_spills += 1;
+        *spill_countdown = local_stack_limit;
+    } else {
+        local_deque.push(child);
+        sys_stats.local_stack_pushes += 1;
+    }
+}
+
 unsafe fn worker(
-    work_rx: crossbeam_channel::Receiver<WorkMsg>,
-    work_tx: crossbeam_channel::Sender<WorkMsg>,
+    worker_index: usize,
+    local_deque: DequeWorker<WorkItem>,
+    stealers: Arc<[Stealer<WorkItem>]>,
+    global_injector: Arc<Injector<WorkItem>>,
     result_tx: crossbeam_channel::Sender<ResultBatch>,
     active_count: Arc<AtomicUsize>,
-    fd_budget: Arc<FdBudget>,
-    workers: usize,
     list_mode: bool,
     max_depth: usize,
-    filter: FileFilter,
+    filter: Arc<FileFilter>,
+    local_stack_limit: usize,
     scan_options: Arc<ScanOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
-    collect_syscall_stats: bool,
 ) {
     // Thread-local reusable buffers
-    let mut buf = vec![0u8; INITIAL_BULK_BUF_SIZE];
+    let mut dirent_buf = vec![0u8; DIRENT_BUF_SIZE];
     let mut sys_stats = LocalSysStats::default();
-    let enable_rdahead = std::env::var_os("FILE_SEARCH_DISABLE_RDAHEAD").is_none();
-
-    // Only request what we need: NAME + OBJTYPE + RETURNED_ATTRS (required for getattrlistbulk)
-    let al = attrlist {
-        bitmapcount: ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-        volattr: 0,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
-    };
     let mut path_buf = PathScratch::new();
-    let mut dir_cbuf: Vec<u8> = Vec::with_capacity(1024); // for openat (NUL-terminated)
-    let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
-    let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
-    let mut local_stack: Vec<WorkItem> = Vec::with_capacity(LOCAL_WORK_STACK_LIMIT);
+    let mut pending_paths: Vec<String> = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+    let mut spill_countdown = local_stack_limit
+        .saturating_sub(worker_index % local_stack_limit)
+        .max(1);
     let has_cancel = cancel_flag.is_some();
+    let mut idle_polls: u32 = 0;
 
     loop {
-        let work = if let Some(local) = local_stack.pop() {
-            local
-        } else {
-            match work_rx.recv() {
-                Ok(WorkMsg::Dir(w)) => w,
-                Ok(WorkMsg::Shutdown) => break,
-                Err(_) => break,
+        let work = loop {
+            if let Some(local) = local_deque.pop() {
+                idle_polls = 0;
+                break Some(local);
             }
+            match global_injector.steal_batch_and_pop(&local_deque) {
+                Steal::Success(item) => {
+                    idle_polls = 0;
+                    break Some(item);
+                }
+                Steal::Retry => continue,
+                Steal::Empty => {}
+            }
+
+            let mut stolen = None;
+            for (idx, stealer) in stealers.iter().enumerate() {
+                if idx == worker_index {
+                    continue;
+                }
+                match stealer.steal_batch_and_pop(&local_deque) {
+                    Steal::Success(item) => {
+                        stolen = Some(item);
+                        break;
+                    }
+                    Steal::Retry => continue,
+                    Steal::Empty => {}
+                }
+            }
+            if stolen.is_some() {
+                idle_polls = 0;
+                break stolen;
+            }
+
+            if active_count.load(Ordering::Acquire) == 0 {
+                break None;
+            }
+
+            // Back off once workers are idle to reduce scheduler churn.
+            idle_polls = idle_polls.saturating_add(1);
+            if idle_polls <= 8 {
+                std::hint::spin_loop();
+            } else if idle_polls <= 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+        };
+        let Some(work) = work else {
+            break;
         };
 
         if has_cancel && is_cancelled(&cancel_flag) {
-            if let Some(fd) = work.dirfd {
-                let _ = close(fd);
-                if collect_syscall_stats {
-                    sys_stats.close_calls += 1;
-                }
-                fd_budget.release();
-            }
-            if collect_syscall_stats {
-                sys_stats.cancel_skipped_dirs += 1;
-            }
-            mark_work_complete(&active_count, &work_tx, workers);
+            let _ = close(work.dirfd);
+            sys_stats.close_calls += 1;
+            sys_stats.cancel_skipped_dirs += 1;
+            mark_work_complete(&active_count);
             continue;
         }
 
         let WorkItem { path, dirfd, depth } = work;
-
-        let mut held_fd = false;
-        let dirfd = match dirfd {
-            Some(fd) => {
-                held_fd = true;
-                fd
-            }
-            None => {
-                // Open by absolute path
-                dir_cbuf.clear();
-                if path.is_empty() {
-                    dir_cbuf.extend_from_slice(b"/");
-                } else {
-                    dir_cbuf.extend_from_slice(path.as_bytes());
-                }
-                dir_cbuf.push(0);
-                let fd = timed_openat(
-                    AT_FDCWD,
-                    dir_cbuf.as_ptr() as *const i8,
-                    O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                    true,
-                    collect_syscall_stats,
-                    &mut sys_stats,
-                );
-                if fd < 0 {
-                    mark_work_complete(&active_count, &work_tx, workers);
-                    continue;
-                }
-                fd
-            }
-        };
         path_buf.set_base(&path);
-
-        // Enable directory read-ahead for better performance
-        if enable_rdahead {
-            timed_set_rdahead(dirfd, collect_syscall_stats, &mut sys_stats);
-        }
-
+        let mut basep: libc::off_t = 0;
         loop {
             if has_cancel && is_cancelled(&cancel_flag) {
                 break;
             }
-            let n = timed_getattrlistbulk(
+
+            let nread = c_getdirentries64(
                 dirfd,
-                &al,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                collect_syscall_stats,
-                &mut sys_stats,
+                dirent_buf.as_mut_ptr().cast(),
+                dirent_buf.len(),
+                &mut basep,
             );
-            if n < 0 {
-                // syscall error; stop scanning this directory
-                break;
-            }
-            if n == 0 {
-                // End of directory
+            if nread <= 0 {
                 break;
             }
 
-            // n == number of records, not bytes
+            let nread = nread as usize;
             let mut p = 0usize;
-            let mut stop_dir_scan = false;
-            for _ in 0..(n as usize) {
-                if has_cancel && is_cancelled(&cancel_flag) {
-                    stop_dir_scan = true;
+            while p < nread {
+                let ent = &*(dirent_buf.as_ptr().add(p) as *const dirent);
+                let reclen = ent.d_reclen as usize;
+                if reclen == 0 || p + reclen > nread {
                     break;
                 }
-                let base = buf.as_ptr().add(p);
 
-                // [u32 reclen]
-                let reclen = read_u32_unaligned(base) as usize;
-
-                // skip returned_attrs (attribute_set_t = 5 * u32)
-                let name_ref_ptr = base.add(4 + 20);
-                let name_ref = read_attrref_unaligned(name_ref_ptr);
-
-                // objtype right after attrreference
-                let objtype = read_u32_unaligned(name_ref_ptr.add(mem::size_of::<attrreference>()));
-
-                // Name bytes are at (name_ref_ptr + name_ref.off) with byte length name_ref.len
-                // Calculate offset relative to buffer start
-                let name_start =
-                    (name_ref_ptr as usize - buf.as_ptr() as usize) + (name_ref.off as usize);
-                let name_len = name_ref.len as usize;
-
-                // Trim a trailing NUL if present; avoid CStr and extra validation work.
-                let name_bytes = &buf[name_start..name_start + name_len];
-                let name_bytes = if !name_bytes.is_empty() && *name_bytes.last().unwrap() == 0 {
-                    &name_bytes[..name_len - 1]
-                } else {
-                    name_bytes
-                };
-
+                let name_len = ent.d_namlen as usize;
+                if name_len == 0 {
+                    p += reclen;
+                    continue;
+                }
+                let name_bytes =
+                    std::slice::from_raw_parts(ent.d_name.as_ptr() as *const u8, name_len);
                 if name_bytes == b"." || name_bytes == b".." {
                     p += reclen;
                     continue;
                 }
 
-                if objtype == VDIR {
+                if ent.d_type == DT_DIR {
                     // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
                     let name = std::str::from_utf8_unchecked(name_bytes);
                     if scan_options.should_skip_dir(&path, name) {
                         p += reclen;
                         continue;
                     }
-                    // Check max_depth: 0 means unlimited, otherwise respect the limit
-                    let next_depth = depth + 1;
-                    if max_depth > 0 && next_depth > max_depth {
-                        p += reclen;
-                        continue;
-                    }
-                    let mut next_fd: Option<RawFd> = None;
-
-                    if fd_budget.try_acquire() {
-                        name_cbuf.clear();
-                        name_cbuf.extend_from_slice(name.as_bytes());
-                        name_cbuf.push(0);
-                        let cfd = timed_openat(
-                            dirfd,
-                            name_cbuf.as_ptr() as *const i8,
-                            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                            false,
-                            collect_syscall_stats,
-                            &mut sys_stats,
-                        );
-                        if cfd >= 0 {
-                            next_fd = Some(cfd);
-                        } else {
-                            fd_budget.release();
-                        }
-                    } else if collect_syscall_stats {
-                        sys_stats.fd_budget_misses += 1;
-                    }
-                    // If we can't acquire fd budget, next_fd stays None and we'll open by path later
-
-                    // Increment counter BEFORE sending to queue to prevent race
-                    active_count.fetch_add(1, Ordering::Relaxed);
-                    let composed = path_buf.compose(name).to_owned();
-                    let child = WorkItem {
-                        path: composed,
-                        dirfd: next_fd,
-                        depth: next_depth,
-                    };
-                    if local_stack.len() < LOCAL_WORK_STACK_LIMIT {
-                        if collect_syscall_stats {
-                            sys_stats.local_stack_pushes += 1;
-                        }
-                        local_stack.push(child);
-                    } else if let Err(err) = work_tx.send(WorkMsg::Dir(child)) {
-                        if collect_syscall_stats {
-                            sys_stats.global_queue_spills += 1;
-                        }
-                        if let WorkMsg::Dir(failed_child) = err.0 {
-                            if let Some(fd) = failed_child.dirfd {
-                                let _ = close(fd);
-                                if collect_syscall_stats {
-                                    sys_stats.close_calls += 1;
-                                }
-                                fd_budget.release();
-                            }
-                        }
-                        mark_work_complete(&active_count, &work_tx, workers);
-                    } else if collect_syscall_stats {
-                        sys_stats.global_queue_spills += 1;
-                    }
-                } else if objtype == VREG && filter.matches_bytes(name_bytes) {
-                    if list_mode {
+                    schedule_child_directory(
+                        dirfd,
+                        name,
+                        ent.d_name.as_ptr(),
+                        depth,
+                        max_depth,
+                        &mut path_buf,
+                        &local_deque,
+                        &global_injector,
+                        &mut spill_countdown,
+                        local_stack_limit,
+                        &active_count,
+                        &mut sys_stats,
+                    );
+                } else if ent.d_type == DT_REG {
+                    if filter.matches_bytes(name_bytes) {
                         // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
                         let name = std::str::from_utf8_unchecked(name_bytes);
-                        let composed = path_buf.compose(name).to_owned();
-                        pending_paths.push(composed);
-                        if pending_paths.len() >= PATH_RESULT_BATCH_SIZE {
-                            let batch = std::mem::take(&mut pending_paths);
-                            let _ = result_tx.send(ResultBatch::Paths(batch));
-                            pending_paths = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+                        emit_match(
+                            list_mode,
+                            &mut path_buf,
+                            name,
+                            &mut pending_paths,
+                            &mut pending_count,
+                            &result_tx,
+                        );
+                    }
+                } else if ent.d_type == DT_UNKNOWN {
+                    // Unknown type: classify with fstatat to avoid open+close probing.
+                    let mut st: libc::stat = std::mem::zeroed();
+                    let stat_rc = timed_fstatat(
+                        dirfd,
+                        ent.d_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                        &mut sys_stats,
+                    );
+                    if stat_rc == 0 {
+                        let mode = st.st_mode as libc::mode_t;
+                        let file_type = mode & (libc::S_IFMT as libc::mode_t);
+                        if file_type == (libc::S_IFDIR as libc::mode_t) {
+                            // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                            let name = std::str::from_utf8_unchecked(name_bytes);
+                            if !scan_options.should_skip_dir(&path, name) {
+                                schedule_child_directory(
+                                    dirfd,
+                                    name,
+                                    ent.d_name.as_ptr(),
+                                    depth,
+                                    max_depth,
+                                    &mut path_buf,
+                                    &local_deque,
+                                    &global_injector,
+                                    &mut spill_countdown,
+                                    local_stack_limit,
+                                    &active_count,
+                                    &mut sys_stats,
+                                );
+                            }
+                        } else if file_type == (libc::S_IFREG as libc::mode_t)
+                            && filter.matches_bytes(name_bytes)
+                        {
+                            // SAFETY: APFS filenames are UTF-8; skip per-entry validation on hot path.
+                            let name = std::str::from_utf8_unchecked(name_bytes);
+                            emit_match(
+                                list_mode,
+                                &mut path_buf,
+                                name,
+                                &mut pending_paths,
+                                &mut pending_count,
+                                &result_tx,
+                            );
                         }
-                    } else {
-                        pending_count += 1;
-                        if pending_count >= COUNT_RESULT_BATCH_SIZE {
-                            let _ = result_tx.send(ResultBatch::Count(pending_count));
-                            pending_count = 0;
-                        }
+                    } else if filter.matches_bytes(name_bytes) {
+                        // Preserve prior fallback behavior on stat errors.
+                        let name = std::str::from_utf8_unchecked(name_bytes);
+                        emit_match(
+                            list_mode,
+                            &mut path_buf,
+                            name,
+                            &mut pending_paths,
+                            &mut pending_count,
+                            &result_tx,
+                        );
                     }
                 }
 
-                p += reclen; // advance to next record
-            }
-
-            if stop_dir_scan {
-                break;
-            }
-
-            if p + BULK_EXPAND_SLACK >= buf.len() && buf.len() < MAX_BULK_BUF_SIZE {
-                let new_len = (buf.len() * 2).min(MAX_BULK_BUF_SIZE);
-                buf.resize(new_len, 0);
+                p += reclen;
             }
         }
 
         let _ = close(dirfd);
-        if collect_syscall_stats {
-            sys_stats.close_calls += 1;
-        }
-        if held_fd {
-            fd_budget.release();
-        }
+        sys_stats.close_calls += 1;
 
         // Decrement counter for this directory finishing
         // (subdirs were already incremented when queued)
-        mark_work_complete(&active_count, &work_tx, workers);
+        mark_work_complete(&active_count);
     }
 
     if list_mode {
@@ -831,13 +765,46 @@ unsafe fn worker(
         let _ = result_tx.send(ResultBatch::Count(pending_count));
     }
 
-    if collect_syscall_stats {
-        flush_local_sys_stats(&sys_stats);
+    flush_local_sys_stats(&sys_stats);
+}
+
+fn raise_nofile_soft_limit() {
+    unsafe {
+        let mut lim = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if getrlimit(RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let mut desired = lim.rlim_max;
+        if desired == RLIM_INFINITY {
+            desired = FD_MAX_LIMIT as u64;
+        }
+        desired = desired.min(FD_MAX_LIMIT as u64);
+        if desired <= lim.rlim_cur {
+            return;
+        }
+        let bumped = rlimit {
+            rlim_cur: desired,
+            rlim_max: lim.rlim_max,
+        };
+        let _ = setrlimit(RLIMIT_NOFILE, &bumped);
     }
 }
 
 fn detect_fd_limit() -> usize {
-    let raw = unsafe { getdtablesize() };
+    let mut lim = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let raw = unsafe {
+        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 {
+            lim.rlim_cur as i32
+        } else {
+            getdtablesize()
+        }
+    };
     let base = if raw > 0 {
         raw as usize
     } else {
@@ -847,21 +814,25 @@ fn detect_fd_limit() -> usize {
         .clamp(FD_MIN_LIMIT, FD_MAX_LIMIT)
 }
 
-fn resolve_scan_workers() -> usize {
-    if let Ok(raw) = std::env::var("FILE_SEARCH_SCAN_WORKERS") {
-        if let Ok(parsed) = raw.parse::<usize>() {
-            return parsed.max(1);
-        }
-    }
-
+fn resolve_scan_workers(fd_limit: usize) -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    if cfg!(target_arch = "aarch64") {
-        cores.min(7).max(2)
+    let core_limited = if cfg!(target_arch = "aarch64") {
+        // Metadata-heavy directory scans tend to saturate before full core count.
+        cores.min(6).max(2)
     } else {
         cores.min(8).max(2)
+    };
+
+    // If file descriptor headroom is tight, cap workers to reduce metadata contention.
+    if fd_limit < 2048 {
+        core_limited.min(2)
+    } else if fd_limit < 8192 {
+        core_limited.min(4)
+    } else {
+        core_limited
     }
 }
 
@@ -869,33 +840,16 @@ fn resolve_scan_workers() -> usize {
 #[derive(Debug)]
 pub struct ScanStats {
     pub duration: Duration,
-    pub getattr_calls: u64,
-    pub getattr_entries: u64,
-    pub getattr_errors: u64,
+    pub fstatat_calls: u64,
+    pub fstatat_fails: u64,
     pub openat_calls: u64,
     pub openat_abs_calls: u64,
     pub openat_rel_calls: u64,
     pub openat_fails: u64,
-    pub openat_ms: f64,
-    pub getattr_ms: f64,
-    pub rdahead_calls: u64,
-    pub rdahead_fails: u64,
-    pub rdahead_ms: f64,
     pub close_calls: u64,
-    pub fd_budget_misses: u64,
     pub local_stack_pushes: u64,
     pub global_queue_spills: u64,
     pub cancel_skipped_dirs: u64,
-}
-
-impl ScanStats {
-    pub fn avg_entries_per_call(&self) -> f64 {
-        if self.getattr_calls > 0 {
-            self.getattr_entries as f64 / self.getattr_calls as f64
-        } else {
-            0.0
-        }
-    }
 }
 
 /// Result of starting a scan operation
@@ -910,26 +864,15 @@ impl ScanHandle {
         // Drain the receiver to ensure all workers complete
         while self.receiver.recv().is_ok() {}
 
-        let openat_nanos = OPENAT_NANOS.load(Ordering::Relaxed);
-        let getattr_nanos = GETATTR_NANOS.load(Ordering::Relaxed);
-        let rdahead_nanos = RDAHEAD_NANOS.load(Ordering::Relaxed);
-
         ScanStats {
             duration: self.start_time.elapsed(),
-            getattr_calls: GETATTR_CALLS.load(Ordering::Relaxed),
-            getattr_entries: GETATTR_ENTRIES.load(Ordering::Relaxed),
-            getattr_errors: GETATTR_ERRORS.load(Ordering::Relaxed),
+            fstatat_calls: FSTATAT_CALLS.load(Ordering::Relaxed),
+            fstatat_fails: FSTATAT_FAILS.load(Ordering::Relaxed),
             openat_calls: OPENAT_CALLS.load(Ordering::Relaxed),
             openat_abs_calls: OPENAT_ABS_CALLS.load(Ordering::Relaxed),
             openat_rel_calls: OPENAT_REL_CALLS.load(Ordering::Relaxed),
             openat_fails: OPENAT_FAILS.load(Ordering::Relaxed),
-            openat_ms: openat_nanos as f64 / 1_000_000.0,
-            getattr_ms: getattr_nanos as f64 / 1_000_000.0,
-            rdahead_calls: RDAHEAD_CALLS.load(Ordering::Relaxed),
-            rdahead_fails: RDAHEAD_FAILS.load(Ordering::Relaxed),
-            rdahead_ms: rdahead_nanos as f64 / 1_000_000.0,
             close_calls: CLOSE_CALLS.load(Ordering::Relaxed),
-            fd_budget_misses: FD_BUDGET_MISSES.load(Ordering::Relaxed),
             local_stack_pushes: LOCAL_STACK_PUSHES.load(Ordering::Relaxed),
             global_queue_spills: GLOBAL_QUEUE_SPILLS.load(Ordering::Relaxed),
             cancel_skipped_dirs: CANCEL_SKIPPED_DIRS.load(Ordering::Relaxed),
@@ -954,27 +897,20 @@ pub fn scan(
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
-    options: ScanOptions,
+    mut options: ScanOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
-    collect_syscall_stats: bool,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
+    raise_nofile_soft_limit();
 
     // Reset global counters
-    GETATTR_CALLS.store(0, Ordering::Relaxed);
-    GETATTR_ENTRIES.store(0, Ordering::Relaxed);
-    GETATTR_ERRORS.store(0, Ordering::Relaxed);
+    FSTATAT_CALLS.store(0, Ordering::Relaxed);
+    FSTATAT_FAILS.store(0, Ordering::Relaxed);
     OPENAT_CALLS.store(0, Ordering::Relaxed);
     OPENAT_ABS_CALLS.store(0, Ordering::Relaxed);
     OPENAT_REL_CALLS.store(0, Ordering::Relaxed);
     OPENAT_FAILS.store(0, Ordering::Relaxed);
-    OPENAT_NANOS.store(0, Ordering::Relaxed);
-    GETATTR_NANOS.store(0, Ordering::Relaxed);
-    RDAHEAD_CALLS.store(0, Ordering::Relaxed);
-    RDAHEAD_FAILS.store(0, Ordering::Relaxed);
-    RDAHEAD_NANOS.store(0, Ordering::Relaxed);
     CLOSE_CALLS.store(0, Ordering::Relaxed);
-    FD_BUDGET_MISSES.store(0, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.store(0, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.store(0, Ordering::Relaxed);
     CANCEL_SKIPPED_DIRS.store(0, Ordering::Relaxed);
@@ -987,12 +923,20 @@ pub fn scan(
         root_path.push('/');
     }
 
+    if options.ignore_dir_names.len() > 1 {
+        options.ignore_dir_names.sort_unstable();
+        options.ignore_dir_names.dedup();
+    }
+    if options.ignore_path_prefixes.len() > 1 {
+        options.ignore_path_prefixes.sort_unstable();
+        options.ignore_path_prefixes.dedup();
+    }
+
     // NUL-terminated bytes for openat
     let mut root_c = root_path.as_bytes().to_vec();
     root_c.push(0);
 
     let fd_limit = detect_fd_limit();
-    let fd_budget = Arc::new(FdBudget::new(fd_limit));
 
     // Ensure root directory can be opened up-front
     let mut root_stats = LocalSysStats::default();
@@ -1002,13 +946,10 @@ pub fn scan(
             root_c.as_ptr() as *const i8,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC,
             true,
-            collect_syscall_stats,
             &mut root_stats,
         );
         if fd < 0 {
-            if collect_syscall_stats {
-                flush_local_sys_stats(&root_stats);
-            }
+            flush_local_sys_stats(&root_stats);
             eprintln!("cannot open root: {root_path}");
             let (_, rx) = unbounded::<ResultBatch>();
             return ScanHandle {
@@ -1019,38 +960,60 @@ pub fn scan(
         fd
     };
 
-    // Worker count: cap to 8; avoid extra contention on APFS metadata
-    let workers = resolve_scan_workers();
+    // Worker count: cap to avoid excess metadata contention.
+    let workers = resolve_scan_workers(fd_limit);
+    let local_stack_limit = LOCAL_WORK_STACK_LIMIT_DEFAULT;
 
-    let (work_tx, work_rx) = unbounded::<WorkMsg>(); // unbounded to prevent deadlock on deep trees
+    let global_injector = Arc::new(Injector::<WorkItem>::new());
+    let mut local_deques = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        local_deques.push(DequeWorker::new_lifo());
+    }
+    let stealers = Arc::<[Stealer<WorkItem>]>::from(
+        local_deques
+            .iter()
+            .map(|deque| deque.stealer())
+            .collect::<Vec<_>>(),
+    );
+
+    // Kick off with root (depth 1). Work items always carry an open directory fd.
+    let root_item = WorkItem {
+        path: root_path,
+        dirfd: root_fd,
+        depth: 1,
+    };
+    flush_local_sys_stats(&root_stats);
+    global_injector.push(root_item);
+
     let (result_tx, result_rx) = unbounded::<ResultBatch>();
     let active = Arc::new(AtomicUsize::new(1)); // root is in-flight
     let scan_options = Arc::new(options);
 
+    let shared_filter = Arc::new(filter);
     let mut handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let rx = work_rx.clone();
-        let tx = work_tx.clone();
+    for (worker_index, local_deque) in local_deques.into_iter().enumerate() {
         let rtx = result_tx.clone();
         let ac = active.clone();
-        let fd_mgr = fd_budget.clone();
-        let flt = filter.clone();
+        let deques = stealers.clone();
+        let injector = global_injector.clone();
+        let flt = Arc::clone(&shared_filter);
+        let stack_limit = local_stack_limit;
         let opts = scan_options.clone();
         let cancel = cancel_flag.clone();
         handles.push(std::thread::spawn(move || unsafe {
             worker(
-                rx,
-                tx,
+                worker_index,
+                local_deque,
+                deques,
+                injector,
                 rtx,
                 ac,
-                fd_mgr,
-                workers,
                 list_mode,
                 max_depth,
                 flt,
+                stack_limit,
                 opts,
                 cancel,
-                collect_syscall_stats,
             )
         }));
     }
@@ -1062,30 +1025,6 @@ pub fn scan(
         }
         drop(result_tx); // Close the channel when all workers are done
     });
-
-    // Kick off with root (depth 1)
-    let root_item = if fd_budget.try_acquire() {
-        WorkMsg::Dir(WorkItem {
-            path: root_path,
-            dirfd: Some(root_fd),
-            depth: 1,
-        })
-    } else {
-        let _ = unsafe { close(root_fd) };
-        if collect_syscall_stats {
-            root_stats.close_calls += 1;
-        }
-        WorkMsg::Dir(WorkItem {
-            path: root_path,
-            dirfd: None,
-            depth: 1,
-        })
-    };
-    if collect_syscall_stats {
-        flush_local_sys_stats(&root_stats);
-    }
-    work_tx.send(root_item).unwrap();
-    drop(work_tx); // allow workers to terminate when queue drains
 
     ScanHandle {
         receiver: result_rx,

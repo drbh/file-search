@@ -319,7 +319,6 @@ pub fn query_content_live(
     include_binary: bool,
     mtime_filter: MtimeFilter,
     requested_workers: usize,
-    collect_scan_stats: bool,
 ) -> io::Result<ContentQueryStats> {
     if needle.is_empty() {
         return Err(io::Error::new(
@@ -339,7 +338,6 @@ pub fn query_content_live(
         file_filter,
         scan_options,
         Some(Arc::clone(&stop)),
-        collect_scan_stats,
     );
     let (work_tx, work_rx) = channel::bounded::<String>(workers.saturating_mul(1024).max(1024));
 
