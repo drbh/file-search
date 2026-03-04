@@ -4,7 +4,7 @@ use libc::dirent;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[link(name = "System")]
 extern "C" {
@@ -51,10 +51,8 @@ static OPENAT_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_ABS_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_REL_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPENAT_FAILS: AtomicU64 = AtomicU64::new(0);
-static OPENAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static FSTATAT_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSTATAT_FAILS: AtomicU64 = AtomicU64::new(0);
-static FSTATAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static CLOSE_CALLS: AtomicU64 = AtomicU64::new(0);
 static LOCAL_STACK_PUSHES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_QUEUE_SPILLS: AtomicU64 = AtomicU64::new(0);
@@ -64,12 +62,10 @@ static CANCEL_SKIPPED_DIRS: AtomicU64 = AtomicU64::new(0);
 struct LocalSysStats {
     fstatat_calls: u64,
     fstatat_fails: u64,
-    fstatat_nanos: u64,
     openat_calls: u64,
     openat_abs_calls: u64,
     openat_rel_calls: u64,
     openat_fails: u64,
-    openat_nanos: u64,
     close_calls: u64,
     local_stack_pushes: u64,
     global_queue_spills: u64,
@@ -80,12 +76,10 @@ struct LocalSysStats {
 fn flush_local_sys_stats(stats: &LocalSysStats) {
     FSTATAT_CALLS.fetch_add(stats.fstatat_calls, Ordering::Relaxed);
     FSTATAT_FAILS.fetch_add(stats.fstatat_fails, Ordering::Relaxed);
-    FSTATAT_NANOS.fetch_add(stats.fstatat_nanos, Ordering::Relaxed);
     OPENAT_CALLS.fetch_add(stats.openat_calls, Ordering::Relaxed);
     OPENAT_ABS_CALLS.fetch_add(stats.openat_abs_calls, Ordering::Relaxed);
     OPENAT_REL_CALLS.fetch_add(stats.openat_rel_calls, Ordering::Relaxed);
     OPENAT_FAILS.fetch_add(stats.openat_fails, Ordering::Relaxed);
-    OPENAT_NANOS.fetch_add(stats.openat_nanos, Ordering::Relaxed);
     CLOSE_CALLS.fetch_add(stats.close_calls, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.fetch_add(stats.local_stack_pushes, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.fetch_add(stats.global_queue_spills, Ordering::Relaxed);
@@ -107,7 +101,6 @@ unsafe fn timed_openat(
     absolute: bool,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    let start = Instant::now();
     let fd = c_openat_nocancel(dfd, path, oflag);
     stats.openat_calls += 1;
     if absolute {
@@ -118,7 +111,6 @@ unsafe fn timed_openat(
     if fd < 0 {
         stats.openat_fails += 1;
     }
-    stats.openat_nanos += start.elapsed().as_nanos() as u64;
     fd
 }
 
@@ -130,13 +122,11 @@ unsafe fn timed_fstatat(
     flags: i32,
     stats: &mut LocalSysStats,
 ) -> i32 {
-    let start = Instant::now();
     let rc = libc::fstatat(dfd, path, stat_buf, flags);
     stats.fstatat_calls += 1;
     if rc < 0 {
         stats.fstatat_fails += 1;
     }
-    stats.fstatat_nanos += start.elapsed().as_nanos() as u64;
     rc
 }
 
@@ -219,7 +209,11 @@ impl ScanOptions {
         if self.prune_defaults && is_default_prune_dir(name) {
             return true;
         }
-        if !self.ignore_dir_names.is_empty() && self.ignore_dir_names.iter().any(|dir| dir == name)
+        if !self.ignore_dir_names.is_empty()
+            && self
+                .ignore_dir_names
+                .binary_search_by(|dir| dir.as_str().cmp(name))
+                .is_ok()
         {
             return true;
         }
@@ -292,6 +286,10 @@ fn mark_work_complete(active_count: &AtomicUsize) {
 pub enum FileFilter {
     /// Match all regular files
     All,
+    /// Fast path: single extension check
+    ExtOnly { ext: Box<[u8]> },
+    /// Fast path: single extension + single contains check
+    ExtAndContains { ext: Box<[u8]>, needle: Box<[u8]> },
     /// Match when all provided clauses pass (logical AND)
     Composite {
         extensions: Option<Vec<Box<[u8]>>>,
@@ -374,14 +372,21 @@ fn contains_ascii_fold(input: &[u8], needle_lower: &[u8]) -> bool {
 
 impl FileFilter {
     #[inline]
-    fn matches_extension(name_bytes: &[u8], exts: &[Box<[u8]>]) -> bool {
-        let Some(dot) = name_bytes.iter().rposition(|&b| b == b'.') else {
-            return false;
-        };
+    fn extension_slice(name_bytes: &[u8]) -> Option<&[u8]> {
+        let dot = name_bytes.iter().rposition(|&b| b == b'.')?;
         let ext = &name_bytes[dot + 1..];
         if ext.is_empty() {
-            return false;
+            None
+        } else {
+            Some(ext)
         }
+    }
+
+    #[inline]
+    fn matches_extension(name_bytes: &[u8], exts: &[Box<[u8]>]) -> bool {
+        let Some(ext) = Self::extension_slice(name_bytes) else {
+            return false;
+        };
         exts.iter().any(|e| eq_ascii_fold(ext, e))
     }
 
@@ -400,6 +405,18 @@ impl FileFilter {
     pub fn matches_bytes(&self, name_bytes: &[u8]) -> bool {
         match self {
             FileFilter::All => true,
+            FileFilter::ExtOnly { ext } => {
+                let Some(ext_slice) = Self::extension_slice(name_bytes) else {
+                    return false;
+                };
+                eq_ascii_fold(ext_slice, ext)
+            }
+            FileFilter::ExtAndContains { ext, needle } => {
+                let Some(ext_slice) = Self::extension_slice(name_bytes) else {
+                    return false;
+                };
+                eq_ascii_fold(ext_slice, ext) && contains_ascii_fold(name_bytes, needle)
+            }
             FileFilter::Composite {
                 extensions,
                 contains_all,
@@ -462,14 +479,14 @@ fn emit_match(
 unsafe fn schedule_child_directory(
     parent_fd: i32,
     name: &str,
+    name_cstr: *const i8,
     depth: usize,
     max_depth: usize,
     path_buf: &mut PathScratch,
     local_deque: &DequeWorker<WorkItem>,
     global_injector: &Injector<WorkItem>,
-    dispatch_counter: &mut usize,
+    spill_countdown: &mut usize,
     local_stack_limit: usize,
-    name_cbuf: &mut Vec<u8>,
     active_count: &AtomicUsize,
     sys_stats: &mut LocalSysStats,
 ) {
@@ -478,12 +495,9 @@ unsafe fn schedule_child_directory(
         return;
     }
 
-    name_cbuf.clear();
-    name_cbuf.extend_from_slice(name.as_bytes());
-    name_cbuf.push(0);
     let child_fd = timed_openat(
         parent_fd,
-        name_cbuf.as_ptr() as *const i8,
+        name_cstr,
         O_RDONLY | O_DIRECTORY | O_CLOEXEC,
         false,
         sys_stats,
@@ -500,10 +514,11 @@ unsafe fn schedule_child_directory(
         depth: next_depth,
     };
 
-    *dispatch_counter = dispatch_counter.wrapping_add(1);
-    if *dispatch_counter % local_stack_limit == 0 {
+    *spill_countdown = spill_countdown.saturating_sub(1);
+    if *spill_countdown == 0 {
         global_injector.push(child);
         sys_stats.global_queue_spills += 1;
+        *spill_countdown = local_stack_limit;
     } else {
         local_deque.push(child);
         sys_stats.local_stack_pushes += 1;
@@ -519,7 +534,7 @@ unsafe fn worker(
     active_count: Arc<AtomicUsize>,
     list_mode: bool,
     max_depth: usize,
-    filter: FileFilter,
+    filter: Arc<FileFilter>,
     local_stack_limit: usize,
     scan_options: Arc<ScanOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -528,10 +543,11 @@ unsafe fn worker(
     let mut dirent_buf = vec![0u8; DIRENT_BUF_SIZE];
     let mut sys_stats = LocalSysStats::default();
     let mut path_buf = PathScratch::new();
-    let mut name_cbuf: Vec<u8> = Vec::with_capacity(1024);
     let mut pending_count: usize = 0;
-    let mut pending_paths: Vec<String> = Vec::with_capacity(1024);
-    let mut dispatch_counter: usize = worker_index;
+    let mut pending_paths: Vec<String> = Vec::with_capacity(PATH_RESULT_BATCH_SIZE);
+    let mut spill_countdown = local_stack_limit
+        .saturating_sub(worker_index % local_stack_limit)
+        .max(1);
     let has_cancel = cancel_flag.is_some();
     let mut idle_polls: u32 = 0;
 
@@ -644,14 +660,14 @@ unsafe fn worker(
                     schedule_child_directory(
                         dirfd,
                         name,
+                        ent.d_name.as_ptr(),
                         depth,
                         max_depth,
                         &mut path_buf,
                         &local_deque,
                         &global_injector,
-                        &mut dispatch_counter,
+                        &mut spill_countdown,
                         local_stack_limit,
-                        &mut name_cbuf,
                         &active_count,
                         &mut sys_stats,
                     );
@@ -670,13 +686,10 @@ unsafe fn worker(
                     }
                 } else if ent.d_type == DT_UNKNOWN {
                     // Unknown type: classify with fstatat to avoid open+close probing.
-                    name_cbuf.clear();
-                    name_cbuf.extend_from_slice(name_bytes);
-                    name_cbuf.push(0);
                     let mut st: libc::stat = std::mem::zeroed();
                     let stat_rc = timed_fstatat(
                         dirfd,
-                        name_cbuf.as_ptr() as *const i8,
+                        ent.d_name.as_ptr(),
                         &mut st,
                         libc::AT_SYMLINK_NOFOLLOW,
                         &mut sys_stats,
@@ -691,14 +704,14 @@ unsafe fn worker(
                                 schedule_child_directory(
                                     dirfd,
                                     name,
+                                    ent.d_name.as_ptr(),
                                     depth,
                                     max_depth,
                                     &mut path_buf,
                                     &local_deque,
                                     &global_injector,
-                                    &mut dispatch_counter,
+                                    &mut spill_countdown,
                                     local_stack_limit,
-                                    &mut name_cbuf,
                                     &active_count,
                                     &mut sys_stats,
                                 );
@@ -829,12 +842,10 @@ pub struct ScanStats {
     pub duration: Duration,
     pub fstatat_calls: u64,
     pub fstatat_fails: u64,
-    pub fstatat_ms: f64,
     pub openat_calls: u64,
     pub openat_abs_calls: u64,
     pub openat_rel_calls: u64,
     pub openat_fails: u64,
-    pub openat_ms: f64,
     pub close_calls: u64,
     pub local_stack_pushes: u64,
     pub global_queue_spills: u64,
@@ -853,19 +864,14 @@ impl ScanHandle {
         // Drain the receiver to ensure all workers complete
         while self.receiver.recv().is_ok() {}
 
-        let openat_nanos = OPENAT_NANOS.load(Ordering::Relaxed);
-        let fstatat_nanos = FSTATAT_NANOS.load(Ordering::Relaxed);
-
         ScanStats {
             duration: self.start_time.elapsed(),
             fstatat_calls: FSTATAT_CALLS.load(Ordering::Relaxed),
             fstatat_fails: FSTATAT_FAILS.load(Ordering::Relaxed),
-            fstatat_ms: fstatat_nanos as f64 / 1_000_000.0,
             openat_calls: OPENAT_CALLS.load(Ordering::Relaxed),
             openat_abs_calls: OPENAT_ABS_CALLS.load(Ordering::Relaxed),
             openat_rel_calls: OPENAT_REL_CALLS.load(Ordering::Relaxed),
             openat_fails: OPENAT_FAILS.load(Ordering::Relaxed),
-            openat_ms: openat_nanos as f64 / 1_000_000.0,
             close_calls: CLOSE_CALLS.load(Ordering::Relaxed),
             local_stack_pushes: LOCAL_STACK_PUSHES.load(Ordering::Relaxed),
             global_queue_spills: GLOBAL_QUEUE_SPILLS.load(Ordering::Relaxed),
@@ -891,7 +897,7 @@ pub fn scan(
     list_mode: bool,
     max_depth: usize,
     filter: FileFilter,
-    options: ScanOptions,
+    mut options: ScanOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> ScanHandle {
     let start_time = std::time::Instant::now();
@@ -900,12 +906,10 @@ pub fn scan(
     // Reset global counters
     FSTATAT_CALLS.store(0, Ordering::Relaxed);
     FSTATAT_FAILS.store(0, Ordering::Relaxed);
-    FSTATAT_NANOS.store(0, Ordering::Relaxed);
     OPENAT_CALLS.store(0, Ordering::Relaxed);
     OPENAT_ABS_CALLS.store(0, Ordering::Relaxed);
     OPENAT_REL_CALLS.store(0, Ordering::Relaxed);
     OPENAT_FAILS.store(0, Ordering::Relaxed);
-    OPENAT_NANOS.store(0, Ordering::Relaxed);
     CLOSE_CALLS.store(0, Ordering::Relaxed);
     LOCAL_STACK_PUSHES.store(0, Ordering::Relaxed);
     GLOBAL_QUEUE_SPILLS.store(0, Ordering::Relaxed);
@@ -917,6 +921,15 @@ pub fn scan(
     }
     if root_path.is_empty() {
         root_path.push('/');
+    }
+
+    if options.ignore_dir_names.len() > 1 {
+        options.ignore_dir_names.sort_unstable();
+        options.ignore_dir_names.dedup();
+    }
+    if options.ignore_path_prefixes.len() > 1 {
+        options.ignore_path_prefixes.sort_unstable();
+        options.ignore_path_prefixes.dedup();
     }
 
     // NUL-terminated bytes for openat
@@ -976,13 +989,14 @@ pub fn scan(
     let active = Arc::new(AtomicUsize::new(1)); // root is in-flight
     let scan_options = Arc::new(options);
 
+    let shared_filter = Arc::new(filter);
     let mut handles = Vec::with_capacity(workers);
     for (worker_index, local_deque) in local_deques.into_iter().enumerate() {
         let rtx = result_tx.clone();
         let ac = active.clone();
         let deques = stealers.clone();
         let injector = global_injector.clone();
-        let flt = filter.clone();
+        let flt = Arc::clone(&shared_filter);
         let stack_limit = local_stack_limit;
         let opts = scan_options.clone();
         let cancel = cancel_flag.clone();

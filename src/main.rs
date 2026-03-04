@@ -255,18 +255,38 @@ fn run() -> io::Result<()> {
         .as_ref()
         .map(|value| value.to_ascii_lowercase().into_bytes().into_boxed_slice());
 
-    let filter =
-        if extensions.is_some() || !contains_all.is_empty() || prefix.is_some() || suffix.is_some()
-        {
-            FileFilter::Composite {
-                extensions,
-                contains_all,
-                prefix,
-                suffix,
-            }
-        } else {
-            FileFilter::All
-        };
+    let use_ext_only_fast_path = prefix.is_none()
+        && suffix.is_none()
+        && contains_all.is_empty()
+        && extensions.as_ref().is_some_and(|exts| exts.len() == 1);
+    let use_ext_contains_fast_path = prefix.is_none()
+        && suffix.is_none()
+        && contains_all.len() == 1
+        && extensions.as_ref().is_some_and(|exts| exts.len() == 1);
+
+    let filter = if use_ext_only_fast_path {
+        FileFilter::ExtOnly {
+            ext: extensions.as_ref().unwrap()[0].clone(),
+        }
+    } else if use_ext_contains_fast_path {
+        FileFilter::ExtAndContains {
+            ext: extensions.as_ref().unwrap()[0].clone(),
+            needle: contains_all[0].clone(),
+        }
+    } else if extensions.is_some()
+        || !contains_all.is_empty()
+        || prefix.is_some()
+        || suffix.is_some()
+    {
+        FileFilter::Composite {
+            extensions,
+            contains_all,
+            prefix,
+            suffix,
+        }
+    } else {
+        FileFilter::All
+    };
 
     // Resolve to absolute path
     let path = std::fs::canonicalize(&path_arg).unwrap_or_else(|_| PathBuf::from(&path_arg));
@@ -445,8 +465,6 @@ fn run() -> io::Result<()> {
         );
         eprintln!("openat failures:       {}", stats.openat_fails);
         eprintln!("close calls:           {}", stats.close_calls);
-        eprintln!("openat time:           {:.2} ms", stats.openat_ms);
-        eprintln!("fstatat time:          {:.2} ms", stats.fstatat_ms);
         eprintln!("local stack pushes:    {}", stats.local_stack_pushes);
         eprintln!("global queue spills:   {}", stats.global_queue_spills);
         eprintln!("cancel-skipped dirs:   {}", stats.cancel_skipped_dirs);
