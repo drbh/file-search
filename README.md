@@ -84,6 +84,13 @@ path:/Users/drbh/Downloads
 
 ran on my home directory with 4,592,063 files that weights roughly 646GB at the time of writing.
 
+```
+f (default) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   3.3s
+f           █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   9.5s
+fd          █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  22.8s
+find        ████████████████████████████████████████ 102.1s
+```
+
 I ran `f` with `-P/--no-default-prunes` to disable pruning of common directories like `node_modules` and `target` since `fd` and `find` don't prune by default. I also ran `f` with `-a/--hidden` to include hidden files. I ran `fd` with `-u/--unrestricted` to include hidden files and ignore `.gitignore` rules. I ran `find` without any pruning or ignoring flags since it doesn't have any.
 
 ### `f` ~9.5s
