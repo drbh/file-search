@@ -11,12 +11,18 @@ brew install drbh/tap/f
 f --help
 ```
 
-## Install from source
+## Performance
 
-```bash
-cargo install --git https://github.com/drbh/file-search.git
-f --help
+searching hundreds of GBs in my home directory
+
 ```
+f (default) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   3.3s
+f           █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   9.5s
+fd          █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  22.8s
+find        ████████████████████████████████████████ 102.1s
+```
+see: [comparisons](#comparison-to-other-tools) for details.
+
 
 ## One Mental Model
 
@@ -90,13 +96,6 @@ path:/Users/drbh/Downloads
 ## Comparison to other tools
 
 ran on my home directory with 4,592,063 files that weights roughly 646GB at the time of writing.
-
-```
-f (default) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   3.3s
-f           █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   9.5s
-fd          █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  22.8s
-find        ████████████████████████████████████████ 102.1s
-```
 
 I ran `f` with `-P/--no-default-prunes` to disable pruning of common directories like `node_modules` and `target` since `fd` and `find` don't prune by default. I also ran `f` with `-a/--hidden` to include hidden files. I ran `fd` with `-u/--unrestricted` to include hidden files and ignore `.gitignore` rules. I ran `find` without any pruning or ignoring flags since it doesn't have any.
 
