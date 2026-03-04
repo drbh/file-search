@@ -7,8 +7,7 @@ __my osx search tool, since mdfind and find/fd don't do everything I want__
 ## Install
 
 ```bash
-brew tap drbh/tap
-brew install f
+brew install drbh/tap/f
 f --help
 ```
 
