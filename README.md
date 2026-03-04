@@ -4,7 +4,15 @@ fast search tool for osx. search files and file contents easily.
 
 __my osx search tool, since mdfind and find/fd don't do everything I want__
 
-## Build
+## Install
+
+```bash
+brew tap drbh/tap
+brew install f
+f --help
+```
+
+## Install from source
 
 ```bash
 cargo install --git https://github.com/drbh/file-search.git
