@@ -125,8 +125,8 @@ Benchmark 1: f ~/ -e mp4 -l | wc -l
   Range (min … max):    3.254 s …  3.584 s    10 runs
 ```
 
-> [!TIP] TLDR;
-> `f` is `~2.4x` faster than `fd` and `~10.7x` faster than `find` in this case. and more like `~6.8x` faster than `fd` and `~30.5x` faster than `find` when using the default pruning rules.
+> [!TIP]
+> TLDR; `f` is `~2.4x` faster than `fd` and `~10.7x` faster than `find` in this case. and more like `~6.8x` faster than `fd` and `~30.5x` faster than `find` when using the default pruning rules.
 
 ## Differences from `fd` and `find`:
 
@@ -138,8 +138,8 @@ personally I either know the a substring of a file name or the extension. I rare
 
 `f` only uses fast filename primitives (`name`, `ext`, `prefix`, `suffix`, `contains`) for speed.
 
-> [!TIP] TLDR;
-> `f` is optimized for simple matching that avoid complex pattern matching that adds complexity and slows down the search.
+> [!TIP]
+> TLDR; `f` is optimized for simple matching that avoid complex pattern matching that adds complexity and slows down the search.
 
 ### 2. Content searching
 
@@ -172,5 +172,5 @@ Benchmark 1: rg  -g "*.md" --text "github.com/drbh/file-search"
   Range (min … max):   458.3 ms … 502.9 ms    10 runs
 ```
 
-> [!TIP] TLDR;
-> `f` also seaches file contents and is `~2.0x` faster than `rg` in many cases and can search out of the current directory.
+> [!TIP]
+> TLDR; `f` also seaches file contents and is `~2.0x` faster than `rg` in many cases and can search out of the current directory.
